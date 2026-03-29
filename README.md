@@ -1,31 +1,19 @@
 # Signal Visualizer
 
-Bachelor project — receiving and decoding ADS-B signals at 1090 MHz using RTL-SDR.
+This script plot the magnitude of each IQ sample by using the formula: 
+Magnitude = sqrt(I*I+Q*Q)
+You can select the scale i.e the number of samples in the x axis, the sampling rate is set at 2 MSPS
+You can selec the slice i.e which time period you want to plot by entering the multiple of the original time interval 
 
-## Amine — Systems & Automation
+## Abderrahim — Filtering and Preamble Detection
 
 | File | Role |
 |------|------|
-| `src/capture/batch_controller.py` | Triggers RTL-SDR capture for N seconds |
-| `src/capture/simulator.py` | Generates fake .bin files for testing without hardware |
-| `src/loader/file_loader.py` | Reads .bin file, converts uint8→float32, subtracts 127.5, returns complex IQ |
-
+| SignalVisualizer.py | plot and select the scale and slice  |
+| captures | has the binary format of the signal over time tunned to 1090MHZ |
 ## Setup
 
 ```bash
 pip install -r requirements.txt
 ```
-
-## Run the loader
-
-```bash
-python src/loader/file_loader.py captures/your_file.bin
-```
-
-## Dev mode (no hardware)
-
-In `src/capture/batch_controller.py`, set:
-```python
-USE_SIMULATOR = True   # no hardware
-USE_SIMULATOR = False  # real RTL-SDR connected
 ```
