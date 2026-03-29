@@ -1,4 +1,4 @@
-# ADS-B Receiver Project
+# Signal Visualizer
 
 Bachelor project — receiving and decoding ADS-B signals at 1090 MHz using RTL-SDR.
 
