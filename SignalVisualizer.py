@@ -5,10 +5,10 @@ import numpy as np
 condition = True
 while condition:
 
-    print("Welcome to ADS-B Visualizer >")
+    print("Welcome to ADS-B Visualizer >>>")
     print("Each plot represent 0.5 ms: press 0 to exit ")
     
-    NSamples = int(input("Enter the number of samples in plot : 20,100,2000 :"))
+    NSamples = int(input("Enter the number of samples in plot : 20,100,2000 :"))*2
     timeOfPlot = (NSamples/2)*0.5
     SliceN = input(f"Select the slice you want to visulaulize by entering the X multiple integer of the {timeOfPlot} micro sec: ")
 
@@ -27,8 +27,8 @@ while condition:
 
     with open(BinaryFile, "rb") as f:
         # 1. Move the pointer to the start of your slice
-        
-        f.seek(NSamples*int(SliceN))
+        start_byte= (NSamples)*(int(SliceN)-1)
+        f.seek(start_byte)
         
         # 2. Read the specified number of bytes
         #while True :
@@ -47,7 +47,7 @@ while condition:
         #				print(hexa)
         #			break
         		 	
-        chunk = f.read()
+        chunk = f.read(NSamples)
         I = []
         Q = []
         Magnitude = []
@@ -59,7 +59,7 @@ while condition:
         for i in range(0,NSamples) :
 
             if (i%2)==0 :
-                I.append(chunk[i]-127)
+                I.append(chunk[i]-127.5)
                 if i==2:
                         Magnitude.append(GetMagnitude(I[0],Q[0]))
                     
@@ -67,7 +67,7 @@ while condition:
                     k = int((i/2)-1)
                     Magnitude.append(GetMagnitude(I[k],Q[k]))
             else:
-                Q.append(chunk[i]-127)
+                Q.append(chunk[i]-127.5)
             
 
        # print(f"I sample value > {I}")
@@ -77,6 +77,29 @@ while condition:
     # Convert each byte into an 8-digit binary string
     #binary_string = " ".join(f"{byte:08b}" for byte in chunk)
     #print(chunk)
+    #Cross correlation
+    # preamble pulses
+    print(len(Magnitude))
+    preamble = np.zeros(16)
+    preamble[1],preamble[5],preamble[8],preamble[10]= np.zeros(4)-1
+    preamble[0],preamble[2],preamble[7],preamble[9]= np.zeros(4)+1
+    k=0
+    temp = 0
+    Corrlation = []
+    limit = int(NSamples/2)
+    print(limit)
+    for To in range(0, limit-17):
+        temp=0
+        k=0
+        for j in range(0,16):
+            temp= temp+k
+            
+            k = Magnitude[To+j]*preamble[j]
+        Corrlation.append(temp)
+    for v in range(0, len(Corrlation)):
+        if Corrlation[v] > 0:
+
+            print(f"\n The shift is <<{v}>> and The Corrlation is <<{Corrlation[v]}>>")
 
     #Plotting the data
     plt.style.use('_mpl-gallery')
@@ -92,11 +115,17 @@ while condition:
     ax = fig.add_axes([0.07, 0.1, 1, 1])
     #fig, ax = plt.subplots(figsize=(4, 2))
 
-    ax.stackplot(x, y)
-    ax.set_xlabel("IQ SAMPLES (A sample in 0.5 micro sec)")
+    ax.plot(x, y)
+    ax.set_xlabel(f"IQ SAMPLES (A sample in 0.5 micro sec) S:{int(start_byte/2)}")
     ax.set_ylabel("Magnitude ")
 
     ax.set(xlim=(0,Samples), xticks=scaler*np.arange(1, Samples/scaler),
            ylim=(0, 5), yticks=np.arange(1, 5))
     plt.grid(visible=True)
     plt.show()
+
+    
+
+
+
+     
