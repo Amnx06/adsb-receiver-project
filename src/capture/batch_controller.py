@@ -42,4 +42,4 @@ def capture_adsb(duration_seconds=0.01, output_dir="captures"):
 
 
 if __name__ == "__main__":
-    capture_adsb(duration_seconds=5)
+    capture_adsb(duration_seconds=0.01)

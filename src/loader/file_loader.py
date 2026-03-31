@@ -26,6 +26,7 @@ def load_iq_file(filepath):
 
     # Step 1 — Read raw bytes as uint8 (values 0 to 255)
     raw = np.fromfile(filepath, dtype=np.uint8)
+    print(f'raw file: {raw}')
 
     # Step 2 — Convert to float32 so we can do math on it
     samples = raw.astype(np.float32)
@@ -34,7 +35,7 @@ def load_iq_file(filepath):
     # RTL-SDR outputs unsigned values (0–255), midpoint is 127.5
     # All signal processing algorithms expect values centered at 0
     samples -= 127.5
-
+    print(f'samples: {samples}')
     # Step 4 — Separate interleaved I and Q channels
     # RTL-SDR stores: [I0, Q0, I1, Q1, I2, Q2, ...]
     # Even indices → I (In-phase)
@@ -61,7 +62,7 @@ if __name__ == "__main__":
 
     # Use argument if given, otherwise fall back to default test file
     path = sys.argv[1] if len(sys.argv) > 1 else \
-           "captures/capture_1090MHZ.bin"
+           "captures/simulated_20260329_151056.bin"
 
     iq = load_iq_file(path)
 
