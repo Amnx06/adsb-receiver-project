@@ -2,6 +2,9 @@ import math
 import matplotlib.pyplot as plt
 import numpy as np
 
+# A script to visualize the sample(or time) versus magnitude signal from SDR tunned to 1090 MHz 
+# WITH SDR Sampling Frequency set to 2 Million Sample Per Second
+
 condition = True
 while condition:
 
@@ -23,40 +26,24 @@ while condition:
     BinaryFile = "captures/capture_Stah1090MHZ.bin"
 
     start_byte = 0# Where to start reading
-    num_bytes = 5   # How many bytes to read
+    
 
     with open(BinaryFile, "rb") as f:
-        # 1. Move the pointer to the start of your slice
+        #  Move the pointer to the start of your slice
         start_byte= (NSamples)*(int(SliceN)-1)
         f.seek(start_byte)
-        
-        # 2. Read the specified number of bytes
-        #while True :
-        #	j=0 
-        #	chunk = f.read()
-        #	for hexa in chunk:
-        #		condition = hexa==(127 or 128 or 126)
-
-        #		if condition :
-        #			j= j+1
-        #			continue
-        		
-        #		else:
-        #            print(j)
-        #			for i in range(0,10): 
-        #				print(hexa)
-        #			break
         		 	
         chunk = f.read(NSamples)
         I = []
         Q = []
         Magnitude = []
-        def GetMagnitude(I,Q):
-            mag = math.sqrt(I*I + Q*Q)
+        
+        def GetMagnitude(I,Q): 
+            mag = math.sqrt(I*I + Q*Q) #calculate Magnitude 
             return round(mag, 2)
         
         
-        for i in range(0,NSamples) :
+        for i in range(0,NSamples) : # To create two lists for I and Q samples and a list for Magnitudes
 
             if (i%2)==0 :
                 I.append(chunk[i]-127.5)
@@ -70,25 +57,17 @@ while condition:
                 Q.append(chunk[i]-127.5)
             
 
-       # print(f"I sample value > {I}")
-        #print(f"Q sample value > {Q}")                        
-        #print(f"Magnitude value > {Magnitude}")
-
-    # Convert each byte into an 8-digit binary string
-    #binary_string = " ".join(f"{byte:08b}" for byte in chunk)
-    #print(chunk)
-    #Cross correlation
+        
     # preamble pulses
     print(len(Magnitude))
-    preamble = np.zeros(16)
-    preamble[1],preamble[5],preamble[8],preamble[10]= np.zeros(4)-1
-    preamble[0],preamble[2],preamble[7],preamble[9]= np.zeros(4)+1
-    k=0
-    temp = 0
+    preamble = np.zeros(16) #To create a list of 16 items that are zeros 
+    preamble[1],preamble[5],preamble[8],preamble[10]= np.zeros(4)-1 # Adding wheights to try to get better correlation
+    preamble[0],preamble[2],preamble[7],preamble[9]= np.zeros(4)+1 # Our preamble has a pulse at 0,1,3.5,4.5 micro sec
+    
     Corrlation = []
     limit = int(NSamples/2)
     print(limit)
-    for To in range(0, limit-17):
+    for To in range(0, limit-17): #Cross correlation
         temp=0
         k=0
         for j in range(0,16):
@@ -101,7 +80,8 @@ while condition:
 
             print(f"\n The shift is <<{v}>> and The Corrlation is <<{Corrlation[v]}>>")
 
-    #Plotting the data
+    #Plotting the data using Matplotlib
+    
     plt.style.use('_mpl-gallery')
 
 
