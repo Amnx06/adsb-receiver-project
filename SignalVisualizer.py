@@ -37,7 +37,7 @@ while condition:
         I = []
         Q = []
         Magnitude = []
-        
+        DC_Shift = 0.7
         def GetMagnitude(I,Q): 
             mag = math.sqrt(I*I + Q*Q) #calculate Magnitude 
             return round(mag, 2)
@@ -48,11 +48,11 @@ while condition:
             if (i%2)==0 :
                 I.append(chunk[i]-127.5)
                 if i==2:
-                        Magnitude.append(GetMagnitude(I[0],Q[0]))
+                        Magnitude.append(GetMagnitude(I[0],Q[0])- DC_Shift)
                     
                 elif i>3:
                     k = int((i/2)-1)
-                    Magnitude.append(GetMagnitude(I[k],Q[k]))
+                    Magnitude.append(GetMagnitude(I[k],Q[k])- DC_Shift)
             else:
                 Q.append(chunk[i]-127.5)
             
@@ -61,25 +61,43 @@ while condition:
     # preamble pulses
     print(len(Magnitude))
     preamble = np.zeros(16) #To create a list of 16 items that are zeros 
-    preamble[1],preamble[5],preamble[8],preamble[10]= np.zeros(4)-1 # Adding wheights to try to get better correlation
+    #preamble[1],preamble[5],preamble[8],preamble[10]= np.zeros(4)-1 # Adding wheights to try to get better correlation
     preamble[0],preamble[2],preamble[7],preamble[9]= np.zeros(4)+1 # Our preamble has a pulse at 0,1,3.5,4.5 micro sec
     
+    preambleNeg = np.zeros(16) #To create a list of 16 items that are zeros 
+    preambleNeg[1],preambleNeg[5],preambleNeg[8],preambleNeg[10],preambleNeg[11],preambleNeg[12],preambleNeg[13],preambleNeg[14],preambleNeg[15]= np.zeros(9)-1 # Adding wheights to try to get better correlation
+    preambleNeg[0],preambleNeg[2],preambleNeg[7],preambleNeg[9]= np.zeros(4)+1 # Our preamble has a pulse at 0,1,3.5,4.5 micro sec
+    Detected = []
+    DetectedNeg = []
+    
     Corrlation = []
+    CorrlationNeg = []
     limit = int(NSamples/2)
     print(limit)
-    for To in range(0, limit-17): #Cross correlation
-        temp=0
-        k=0
-        for j in range(0,16):
-            temp= temp+k
-            
-            k = Magnitude[To+j]*preamble[j]
-        Corrlation.append(temp)
-    for v in range(0, len(Corrlation)):
-        if Corrlation[v] > 0:
 
-            print(f"\n The shift is <<{v}>> and The Corrlation is <<{Corrlation[v]}>>")
+    
 
+    def CrossCorrelation(preamble,Corrlation,Detected):
+        for To in range(0, limit-17): #Cross correlation
+            temp=0
+            k=0
+            for j in range(0,16):
+                temp= temp+k
+                
+                k = Magnitude[To+j]*preamble[j]
+            Corrlation.append(temp)
+        for v in range(0, len(Corrlation)):
+            if Corrlation[v] > 3:
+
+                #print(f"\n The shift is <<{v}>> and The Corrlation is <<{Corrlation[v]}>>")
+                Detected.append(v)
+    CrossCorrelation(preamble,Corrlation,Detected)
+    CrossCorrelation(preambleNeg,CorrlationNeg,DetectedNeg)
+    for l in range(0, len(Detected)):
+        a = Corrlation[Detected[l]] - CorrlationNeg[Detected[l]]
+        #print(f"\n{a}")
+        if a < 1:
+            print(f"The shift is <{Detected[l]}> ORGINAL CORRELATION <{Corrlation[Detected[l]]}> and the Negative <{CorrlationNeg[Detected[l]]}> ")
     #Plotting the data using Matplotlib
     
     plt.style.use('_mpl-gallery')
