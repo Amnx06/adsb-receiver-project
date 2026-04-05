@@ -1,7 +1,9 @@
-import math
+import math, os 
 import matplotlib.pyplot as plt
 import numpy as np
 import time
+from concurrent.futures import ProcessPoolExecutor #this is for creating process
+from functools import partial
 
 # A script to visualize the sample(or time) versus magnitude signal from SDR tunned to 1090 MHz 
 # WITH SDR Sampling Frequency set to 2 Million Sample Per Second
@@ -89,50 +91,67 @@ while condition:
     PreambleStart = []
     limit = int(NSamples/2)
     EstimtedTime = (limit/10000)*37
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    
     print(f"Time Estimation is {EstimtedTime} in Second")
-    def PreambleDetector(preamble,peaksIndex, G): #G is the multiple that we want to campare to the noise  
-        Pcounter=0
-        peaks = []
-        PreambleStart = []
-        preD=[]
-        vallies = []
-        WeightedSamples =[]
-        for To in range(0, limit-17): #Cross correlation
-            PercentageFinish = 100*(To)/(limit-17)
-            PercentageFinish= round(PercentageFinish, 2)
-            if PercentageFinish % 10== 0:
+    def PreambleDetector(Magnitude, preamble,peaksIndex, G,worker): #G is the multiple that we want to campare to the noise  
+        
+        with open(TextFile, "a") as write:
+            TextFile = os.path.join(script_dir, f"output{worker}.txt")
+            Pcounter=0
+            peaks = []
+            PreambleStart = []
+            preD=[]
+            vallies = []
+            WeightedSamples =[]
+            for To in range(0, limit-17): #Cross correlation
+                PercentageFinish = 100*(To)/(limit-17)
+                PercentageFinish= round(PercentageFinish, 2)
+                if PercentageFinish % 10== 0:
+                    write.write(f"\nProgress >> {PercentageFinish} %")
+                    #print(f"\nProgress >> {PercentageFinish} %")
+                m=0
+                for j in range(0,16):
+                        
+                    m = Magnitude[To+j]*preamble[j]
+                    WeightedSamples.append(m)
+                    for index in peaksIndex:
+                        e= j == int(index)
+                        preD.append(e)
+                        if len(preD) == len(peaksIndex):
+                            if sum(preD)==1:
+                                peaks.append(WeightedSamples[j])
+                                preD=[]
+                            else:
+                                vallies.append(m)
+                                preD=[]
+                ValliesAvg = -(sum(vallies)/len(vallies))
+                PeakMin = min(peaks)
+                #print(f"\n vallies >> {vallies} and Peakmin> {peaks}< at shift >{To}<")
                 
-                print(f"\nProgress >> {PercentageFinish} %")
-            m=0
-            for j in range(0,16):
-                    
-                m = Magnitude[To+j]*preamble[j]
-                WeightedSamples.append(m)
-                for index in peaksIndex:
-                    e= j == int(index)
-                    preD.append(e)
-                    if len(preD) == len(peaksIndex):
-                        if sum(preD)==1:
-                            peaks.append(WeightedSamples[j])
-                            preD=[]
-                        else:
-                            vallies.append(m)
-                            preD=[]
-            ValliesAvg = -(sum(vallies)/len(vallies))
-            PeakMin = min(peaks)
-            #print(f"\n vallies >> {vallies} and Peakmin> {peaks}< at shift >{To}<")
+                #print(f"\n vallies avg >> {ValliesAvg} and Peakmin> {PeakMin}< at shift >{To}<")
+                p = PeakMin-G*ValliesAvg
+                #print(f"\n diff >> {p} at shift > {To}<")
+                if PeakMin>G*ValliesAvg:
+                    PreambleStart.append(To)
+                    #print(f"Possible Preamble AT shift <{To}>")
+                    write.write(f"Possible Preamble AT shift <{To}>")
+                    Pcounter = Pcounter+1
+                #write.flush() #forve python to write from the buffer rom to disk
+        return Pcounter
+
+        #print(f"Total Preamble detected {Pcounter} at {PreambleStart}  shifts")
+    
             
-            #print(f"\n vallies avg >> {ValliesAvg} and Peakmin> {PeakMin}< at shift >{To}<")
-            p = PeakMin-G*ValliesAvg
-            #print(f"\n diff >> {p} at shift > {To}<")
-            if PeakMin>G*ValliesAvg:
-                PreambleStart.append(To)
-                print(f"Possible Preamble AT shift <{To}>")
-                Pcounter = Pcounter+1
+    if __name__ =="__main__":
+        chunks = np.array_split(Magnitude, 4)
+        Detector = partial(PreambleDetector,preamble=preamble,PeaksIndex=PeaksIndex,G=2 )
+        with ProcessPoolExecutor() as executor :
+            for worker,c in enumerate(chunks) : 
+                results = list(executor.submit(Detector, c,worker))
+            print(results) 
 
 
-        print(f"Total Preamble detected {Pcounter} at {PreambleStart}  shifts")
-    PreambleDetector(preamble,PeaksIndex,2)
     #Plotting the data using Matplotlib
     
     plt.style.use('_mpl-gallery')
@@ -159,6 +178,5 @@ while condition:
 
     
 
-
-
+    
      
