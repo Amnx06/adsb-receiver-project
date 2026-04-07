@@ -62,7 +62,7 @@ if __name__ == "__main__":
 
     # Use argument if given, otherwise fall back to default test file
     path = sys.argv[1] if len(sys.argv) > 1 else \
-           "captures/simulated_20260329_151056.bin"
+           "captures/capture_Stah1090MHZ.bin"
 
     iq = load_iq_file(path)
 
