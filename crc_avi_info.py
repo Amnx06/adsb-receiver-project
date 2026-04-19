@@ -101,10 +101,14 @@ def crc_legacy(msg: str, encode: bool = False) -> int:
 
     return reminder
 
+f1 = open("FoundMsg.txt", "r+")
 
-#8D406B902015A678D4D220AA4BDA
-msg = "8D406B902015A678D4D220AA4BDA"
+binmsg = f1.readline()
+msg = pms.bin2hex(binmsg)
+print( crc(msg))
 if crc(msg) == 0 :
-	print("msg is correct")
+	print("msg is correct and :")
+	print("type code is", pms.typecode(msg))
+	pms.tell(msg)
 else :
 	print("incorrect msg")
