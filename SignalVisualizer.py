@@ -146,7 +146,6 @@ while condition:
             WeightedSamples = []
             peaks = []
             vallies =[]
-    
 
     level = int(limit/4)
 
@@ -176,12 +175,33 @@ while condition:
     
     print(f"\n >>>>>Total Preamble detected {Pcounter} at {PreambleStart}  shifts<<<<<<")
 
+    msg ={}
+    for start in PreambleStart:
+            msg[start]= Magnitude[start + 16:start+ 240]
+    #print(msg)
 
-
-
-
-
+    def Bit_Slicer(message):
+        
+        for key,value in message.items():
+            print(f"key is {key}")
+            decoded=[]
+            for k in range(0,223,2):
+                if value[k] > value[k+1]:
+                    decoded.append(1) 
+                elif value[k] < value[k+1]:
+                    decoded.append(0)
+                else:
+                    #del message[key]
+                    print(f"Value 1 :{value[k]} and value2 : {value[k+1]} ")
+                    decoded[:] = "Rejected"
+                    break
+            print(len(decoded))
+            message[key]="".join(map(str,decoded))
+            print()
     #Plotting the data using Matplotlib
+    
+    Bit_Slicer(msg)
+    print(msg)
     if limit < 2000:
         plt.style.use('_mpl-gallery')
         
@@ -243,7 +263,7 @@ while condition:
         ax.set_ylabel("Magnitude ")
 
         ax.set(xlim=(0, Samples), xticks= scaler*np.arange(1, Samples/scaler),
-               ylim=(0, 5), yticks=np.arange(1, 5))
+               ylim=(0, 12), yticks=np.arange(1, 12))
 
         #  Button
         # Pass the stem container (line) and base arrays into the class
