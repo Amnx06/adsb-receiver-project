@@ -4,7 +4,12 @@ import numpy as np
 import time
 from matplotlib.widgets import Button,TextBox
 import threading 
+import json
+import pyModeS as pms
+from pyModeS.util import bin2hex,crc
 
+#f1 = open("FoundMsg.txt", "r+")
+#binmsg = f1.readline()
 # A script to visualize the sample(or time) versus magnitude signal from SDR tunned to 1090 MHz 
 # WITH SDR Sampling Frequency set to 2 Million Sample Per Second
 
@@ -67,12 +72,12 @@ while condition:
         
     # preamble pulses
     #print(len(Magnitude))
-    preamble = np.zeros(16) #To create a list of 16 items that are zeros 
-    PeaksIndex = [0,2,7,9]
+    preamble = np.zeros(26) #To create a list of 16 items that are zeros 
+    PeaksIndex = [0,2,7,9,16,19,21,23,24]
     #print(preamble)
     
     f = []
-    for r in range(0,16):
+    for r in range(0,26):
         for indx in PeaksIndex :
             
             
@@ -84,11 +89,11 @@ while condition:
                     f=[]
                 else:
                     
-                    preamble[r] = -1
+                    preamble[r] = 0
                     f=[] # to write preamble pulses 
                 
 
-                
+              
 
     #print(preamble)
     Pcounter=0
@@ -101,107 +106,305 @@ while condition:
     Pcounter=0
     PreambleStart = []
     
-    def PreambleDetector(preamble,peaksIndex, G, StartT,FinishT, ThreadNum): #G is the multiple that we want to compare to the noise  
-        global Pcounter, PreambleStart
-        peaks = []
-        vallies = []
-        
-        preD=[]
-        
-        WeightedSamples =[]
-        for To in range(StartT, FinishT): #creating weighted samples, expected pulses index*1(peaks)
+    signal = Magnitude[0:int(NSamples/2)]
+
+    # CRITERION 1 : CFAR Detection 
+    CorrelationValues = np.correlate(signal, preamble, mode= "valid")
+    Static_Ratios = []
+    Threshold = 8
+    ExceedThreshold ={}
+    for maximum in range(20,len(CorrelationValues)):
+        Static_Ratio = 0
+        valleyAvg = 0.2*(CorrelationValues[maximum-6]+CorrelationValues[maximum-11]+
+            CorrelationValues[maximum-13]+CorrelationValues[maximum-18]+CorrelationValues[maximum-20])
+        PeakValue = CorrelationValues[maximum]
+
+        Static_Ratio = PeakValue/valleyAvg
+        #if valleyAvg <1 :
+        #    Static_Ratio= PeakValue/9
+        Static_Ratios.append(Static_Ratio)
+        if Static_Ratio>Threshold:
+            if ExceedThreshold:
+                # To ignore the peaks of correlation of the ppm
                 
-            m=0   # other index vallies and multiplied by -1
-            for j in range(0,16):
                     
-                m = Magnitude[To+j]*preamble[j]
-                WeightedSamples.append(m)
-                for index in peaksIndex:
-                    e= j == int(index)
-                    preD.append(e)
-                    if len(preD) == len(peaksIndex):
-                        if sum(preD)==1:
-                            peaks.append(WeightedSamples[j])
-                            preD=[]
-                        else:
-                            vallies.append(m)
-                            preD=[]
+                if maximum-list(ExceedThreshold)[-1] < 240 :
+                    if Static_Ratio>list(ExceedThreshold.values())[-1]:
+                        ExceedThreshold.popitem()#delete last iem of dic
+                        ExceedThreshold[maximum] = Static_Ratio
+                else:    
+                        ExceedThreshold[maximum] = Static_Ratio 
+            else :    
+                ExceedThreshold[maximum] = Static_Ratio
 
-            ValliesAvg = -(sum(vallies)/len(vallies))
-            ValliesMax = -min(vallies)*2
-            PeakMin = min(peaks)
-            
-            p = PeakMin-G*ValliesAvg
-            
-            
-            with lock:
-                if (PeakMin>5*ValliesAvg) and (PeakMin>0.6) :
-                    if PeakMin > ValliesMax:
-                    
-                    # here use thread 
-                        PreambleStart.append(To)
-                        #print(f"\nvallies max {ValliesMax} and PeakMin {PeakMin}, ")
-                        Pcounter = Pcounter+1
-
-            WeightedSamples = []
-            peaks = []
-            vallies =[]
-
-    level = int(limit/4)
-
-    thread1 = threading.Thread(target = PreambleDetector, args= (preamble,PeaksIndex,2,0,level, 1))
-
-    thread2 = threading.Thread(target = PreambleDetector, args= (preamble,PeaksIndex,2,level,2*level,2))
-
-    thread3 = threading.Thread(target = PreambleDetector, args= (preamble,PeaksIndex,2,2*level,level*3,3))
-
-    thread4 = threading.Thread(target = PreambleDetector, args= (preamble,PeaksIndex,2,3*level,4*level,4))
-    
-    thread1.start()
-    
-    thread2.start()
-
-    thread3.start()
-    
-    thread4.start()
-    
-    thread1.join()#The Main Thread "hangs" right there. It will not execute the next line until the thread being "joined" is done
-    
-    thread2.join()
-    
-    thread3.join()
-    
-    thread4.join()
-    
-    print(f"\n >>>>>Total Preamble detected {Pcounter} at {PreambleStart}  shifts<<<<<<")
-
-    msg ={}
-    for start in PreambleStart:
-            msg[start]= Magnitude[start + 16:start+ 240]
-    #print(msg)
-
-    def Bit_Slicer(message):
+    def Bit_Slicer(message, Msg_length=224):
         
         for key,value in message.items():
-            print(f"key is {key}")
+            #print(f"key is {key}")
             decoded=[]
-            for k in range(0,223,2):
-                if value[k] > value[k+1]:
+
+            for k in range(0,Msg_length,2):
+                
+                #print(f"\nlen value : {len(value)} string index : {k} and the value is {value}")
+                if value[k] >= value[k+1]:
                     decoded.append(1) 
                 elif value[k] < value[k+1]:
                     decoded.append(0)
                 else:
                     #del message[key]
-                    print(f"Value 1 :{value[k]} and value2 : {value[k+1]} ")
+                    #print(f"Value 1 :{value[k]} and value2 : {value[k+1]} ")
                     decoded[:] = "Rejected"
                     break
-            print(len(decoded))
+            #print(len(decoded))
             message[key]="".join(map(str,decoded))
-            print()
+            #print()
     #Plotting the data using Matplotlib
+    Indices_2nd_criterion =[]
+    u =[]
+    Theta_2nd_criterion = {}
+    Theta = {}
+    
+
+        #print(f"\nnumber of exceed C1: {len(ExceedThreshold)} \nthe indices  {key:15} , correlation: {value} ")
+        
+    # Criterion 2 : DETERMINISTIC SYMBOL MATCH
+        
+        
+    for key, value in ExceedThreshold.items():
+        # 2. Logic to extract segments (Magnitude is likely your signal array)
+        e = Magnitude[key:key+26]
+        ref="110010001"
+        # We create a temporary dict for this specific key to pass to Bit_Slicer
+        temp_theta = {}
+        temp_theta[key] = e[0:4] + e[6:10] + e[-10:] # 18 samples total
+
+        # 3. Slice bits (18 samples / 2 = 9 bits)
+        Bit_Slicer(temp_theta, Msg_length=18)
+
+        # 4. Check for a match
+        # Since temp_theta only has one key, this loop is fast
+        for k, v in temp_theta.items():   
+            if v == ref:
+                # Save the match to our master dictionary
+                Theta_2nd_criterion[k] = v
+
+# Now, after the loop is done, you can see how many passed:
+    print(f"Total signals passing Criterion 2: {len(Theta_2nd_criterion)}")
+
+    max_idx = np.argmax(CorrelationValues)
+    #print(f"max value : {max(CorrelationValues)} index :{max_idx} ")
+    print(f"\nCriterion 1 : {len(ExceedThreshold)} success at {list(ExceedThreshold.keys())} ")
+    print(f"\nCriterion 2 : {len(Theta_2nd_criterion)} Success at {list(Theta_2nd_criterion.keys())}")
+    
+
+
+    #Criterion 3: Consistent Power Test
+    ThetaD ={}
+    h=[]
+    Thershold3 = 6.656
+    ThetaD_3rd_criterion = {}
+    for index in Theta_2nd_criterion.keys():
+        k=0
+        Initial_Magnitudes = Magnitude[index:index+26]
+        # 0,2,5,7,8,11,13,15,16
+        k = [Initial_Magnitudes[0],Initial_Magnitudes[2],Initial_Magnitudes[7],Initial_Magnitudes[9]
+        ,Initial_Magnitudes[16],Initial_Magnitudes[19],Initial_Magnitudes[21],Initial_Magnitudes[23],Initial_Magnitudes[24]]
+        ThetaD[index] = k
+        #print(f"\nkey is {index} k is {k}")
+        PowerRatio = max(k)/min(k)
+        #print(f" \nPowerRatio is : {(PowerRatio)},")
+        if PowerRatio<Thershold3 :
+            ThetaD_3rd_criterion[index] =   PowerRatio 
+            h.append(index)
+    print(f"\ncriterion 3 : {len(ThetaD_3rd_criterion)} success , shifts {list(ThetaD_3rd_criterion.keys())}")
+
+    
+    #criterion 4 :
+    Crit4 = {}
+    Success_4th_criterion = {}
+    for index in ThetaD_3rd_criterion.keys():
+                
+        Initial_Magnitudes= Magnitude[index:index+26]   
+        Pulses = [Initial_Magnitudes[0],Initial_Magnitudes[2],Initial_Magnitudes[7],Initial_Magnitudes[9]
+        ,Initial_Magnitudes[16],Initial_Magnitudes[19],Initial_Magnitudes[21],Initial_Magnitudes[23],Initial_Magnitudes[24]]
+        
+
+
+        sigma = sum(Pulses)/len(Pulses)        
+        
+        X =  [Initial_Magnitudes[4],Initial_Magnitudes[5]]+ Initial_Magnitudes[10:16]
+        for r in range(0,8,2):
+            if (X[r] and X[r+1]) <=(sigma/2):
+                Crit4[int(r/2)] = "Empty"
+        if len(Crit4)>=2:
+            Success_4th_criterion[index] = len(Crit4)
+    print(f"\ncriterion 4 : {len(Success_4th_criterion)} success , shifts {list(Success_4th_criterion.keys())}")
+                
+
+
+
+
+
+
+
+    msg ={}
+    for start in Success_4th_criterion.keys():
+            msg[start]= Magnitude[start + 16:start+ 240]
+    #print(msg)
+        
+    
+
+    def Decoding(binmsg):
+    # Ensure binmsg is a dictionary of binary strings
+        for key, value in binmsg.items():
+            print(f"\n{'='*50}")
+            print(f"REPORT FOR INDEX: {key}")
+            
+            try:
+                # 1. Convert binary string to Hex 
+                bin_str = str(value)
+                hex_msg = pms.util.bin2hex(bin_str)
+                
+                # 2. Decode the message 
+                decoded = pms.decode(hex_msg)
+                
+                # 3. Handle base validation
+                is_valid = decoded.get("crc_valid", False)
+                tc = decoded.get("typecode")
+                icao = decoded.get("icao")
+
+                print(f"Hex Message:  {hex_msg}")
+                print(f"CRC Result:   {'Valid' if is_valid else 'Corrupted'}")
+                print(f"ICAO Address: {icao}")
+                print(f"Typecode:     {tc}")
+                print(f"{'-'*50}")
+
+                if not is_valid or tc is None:
+                    print("Skipping detailed parse (Invalid CRC or Unknown Typecode).")
+                    continue
+
+                # 4. Detailed Parsing Logic
+
+                # IDENTIFICATION (Typecodes 1-4)
+                if 1 <= tc <= 4:
+                    print(f"[IDENTIFICATION]")
+                    print(f"Callsign: {decoded.get('callsign', 'N/A')}")
+
+                # SURFACE POSITION (Typecodes 5-8)
+                elif 5 <= tc <= 8:
+                    print(f"[SURFACE POSITION]")
+                    
+                    # Ground Speed Math
+                    gs = decoded.get('groundspeed')
+                    if gs is not None:
+                        gs_kmh = round(gs * 1.852, 2)
+                        print(f"Ground Speed: {gs} knots ({gs_kmh} km/h)")
+                    
+                    # Position & CPR Logic
+                    lat = decoded.get('latitude')
+                    lon = decoded.get('longitude')
+                    
+                    if lat is not None and lon is not None:
+                        print(f"Global Latitude:  {lat}")
+                        print(f"Global Longitude: {lon}")
+                    else:
+                        # Manually slice the Raw CPR values from the 112-bit binary string
+                        if len(bin_str) >= 88:
+                            raw_lat = int(bin_str[54:71], 2)
+                            raw_lon = int(bin_str[71:88], 2)
+                            print(f"Raw CPR Lat: {raw_lat} (Need reference to decode Global Lat)")
+                            print(f"Raw CPR Lon: {raw_lon} (Need reference to decode Global Lon)")
+                    
+                    # Get CPR Type (Fallback to checking bit 54 manually if missing)
+                    cpr = decoded.get("cpr_format")
+                    if cpr is None and len(bin_str) >= 54:
+                        cpr = int(bin_str[53])
+                    print(f"CPR Type: {'Odd' if cpr == 1 else 'Even'}")
+
+                # AIRBORNE POSITION (Typecodes 9-18)
+                elif 9 <= tc <= 18:
+                    print(f"[AIRBORNE POSITION]")
+                    print(f"Altitude:  {decoded.get('altitude', 'N/A')} ft")
+                    
+                    lat = decoded.get('latitude')
+                    lon = decoded.get('longitude')
+                    
+                    if lat is not None and lon is not None:
+                        print(f"Global Latitude:  {lat}")
+                        print(f"Global Longitude: {lon}")
+                    else:
+                        # Manually slice the Raw CPR values from the 112-bit binary string
+                        # Message Bit 55-71 (Lat) and 72-88 (Lon)
+                        if len(bin_str) >= 88:
+                            raw_lat = int(bin_str[54:71], 2)
+                            raw_lon = int(bin_str[71:88], 2)
+                            print(f"Raw CPR Lat: {raw_lat} (Need Odd/Even Pair to decode)")
+                            print(f"Raw CPR Lon: {raw_lon} (Need Odd/Even Pair to decode)")
+
+                    # Get CPR Type
+                    cpr = decoded.get("cpr_format")
+                    if cpr is None and len(bin_str) >= 54:
+                        cpr = int(bin_str[53])
+                    print(f"CPR Type: {'Odd' if cpr == 1 else 'Even'}")
+
+
+                # AIRBORNE VELOCITY (Typecode 19)
+                elif tc == 19:
+                    print(f"[AIRBORNE VELOCITY]")
+                    
+                    # Ground Speed Math (Knots to km/h)
+                    gs = decoded.get('groundspeed')
+                    if gs is not None:
+                        gs_kmh = round(gs * 1.852, 2)
+                        print(f"Ground Speed: {gs} knots ({gs_kmh} km/h)")
+                        print(f"Track Angle:  {decoded.get('track')}°")
+                    
+                    # Airspeed Math (Knots to km/h)
+                    airspeed = decoded.get('airspeed')
+                    if airspeed is not None:
+                        as_kmh = round(airspeed * 1.852, 2)
+                        print(f"Air Speed:    {airspeed} knots ({as_kmh} km/h)")
+                        print(f"Heading:      {decoded.get('heading')}°")
+                    
+                    # Vertical Rate Math (fpm to km/min and m/s)
+                    vrate_fpm = decoded.get('vertical_rate')
+                    if vrate_fpm is not None:
+                        # Convert to Kilometers per minute
+                        vrate_km_min = round((vrate_fpm * 0.3048) / 1000, 4)
+                        # Convert to Meters per second (Commonly used in engineering)
+                        vrate_ms = round((vrate_fpm * 0.3048) / 60, 2)
+                        
+                        status = "Climbing" if vrate_fpm > 0 else "Descending"
+                        print(f"Vertical Rate: {vrate_fpm} fpm ({status})")
+                        print(f"            -> {abs(vrate_km_min)} km/min")
+                        print(f"            -> {abs(vrate_ms)} m/s")
+
+                # OPERATIONAL STATUS (Typecode 31)
+                elif tc == 31:
+                    print(f"[OPERATIONAL STATUS]")
+                    print(f"Capability: {decoded.get('capability', 'N/A')}")
+
+            except Exception as e:
+                print(f"Detailed Error at index {key}: {e}")
+    def SNR_Calculation(indices):
+        for index in indices :        
+
+
+            l = Magnitude[index:index+224]
+            x = (sum(l))*(sum(l))/224#SignalPower
+            
+            p = Magnitude[index-225:index-1]
+        
+            w = (sum(p))*(sum(p))/224 #noisePower
+            n = 10*math.log10(x/w)
+            print(f"\nthe SNR at {index} is {n}")
+    SNR_Calculation(Indices_2nd_criterion)
     
     Bit_Slicer(msg)
     print(msg)
+    Decoding(msg)
+    
+    
     if limit < 2000:
         plt.style.use('_mpl-gallery')
         
@@ -247,14 +450,23 @@ while condition:
         y = Magnitude
 
         # the preamble pattern 
-        xx = np.arange(0, 16)
-        yy = np.zeros(16)
-        yy[0], yy[2], yy[7], yy[9] = 0.5, 0.5, 0.5, 0.5
+        xx = np.arange(0, 26)
+        yy = np.zeros(26) 
+        yy[0], yy[2], yy[7], yy[9],yy[16],yy[19],yy[21],yy[23],yy[24] = 3, 3, 3, 3, 3, 3, 3, 3, 3
 
+        Last_index = len(CorrelationValues)
+        Corr_x = range(0,Last_index)
         
+        Corr_y = CorrelationValues
+
+        fig2 = plt.figure(figsize=(6,4))
+        cx = fig2.add_axes([0.07, 0.1, 1, 1])
+
         fig = plt.figure(figsize=(6, 4))
         ax = fig.add_axes([0.07, 0.1, 1, 1])
 
+        
+        
         # Plot signal and stem
         ax.plot(x, y, label="Signal")
         line = ax.stem(xx, yy, linefmt='red', label="Preamble pulses")
@@ -275,9 +487,19 @@ while condition:
         box = plt.axes([0.87, 0.005, 0.1, 0.04])
         InputShift= TextBox(box, "jump to: ", initial = "0")
         InputShift.on_submit(callback.Shift_by_TextBox)
+        cx.plot(Corr_x,Corr_y, color="red")
+        cx.set(xlim=(0, Last_index), xticks= scaler*np.arange(1, Last_index/scaler),
+               ylim=(0, 500), yticks= range(0,500,50)) 
+        
         plt.grid(visible=True)
         plt.show()
+        #correlation graph 
 
+
+        
+        
+        #plt.grid(visible=True)
+        #plt.show()
 
     else :
         print("\n Reduce the number of Samples in plot -must be lower than 2000 - in order to VISUALIZE!")
