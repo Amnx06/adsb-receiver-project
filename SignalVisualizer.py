@@ -1,505 +1,434 @@
+from pathlib import Path
 import math
+import os
 import matplotlib.pyplot as plt
 import numpy as np
-import time
-from matplotlib.widgets import Button,TextBox
-import threading 
-import json
+from matplotlib.widgets import Button, TextBox
 import pyModeS as pms
-from pyModeS.util import bin2hex,crc
 
-#f1 = open("FoundMsg.txt", "r+")
-#binmsg = f1.readline()
-# A script to visualize the sample(or time) versus magnitude signal from SDR tunned to 1090 MHz 
-# WITH SDR Sampling Frequency set to 2 Million Sample Per Second
 
-condition = True
-while condition:
-    s=0
+def prompt_user_parameters() -> tuple[int, int, int]:
+    """Ask the user for the number of samples and the slice.
+
+    Returns:
+        tuple: (num_iq_bytes, slice_index, scaler)
+    """
     print("=====================>>>>>>>><<<<<<<==================")
     print("\nWelcome to ADS-B Visualizer >>>")
-    print("\nPress 0 to exit ")
-    
-    NSamples = int(input("Enter the number of samples in plot : 20,100,2000 :"))*2
-    timeOfPlot = (NSamples/2)*0.5
-    SliceN = input(f"Select the slice you want to visulaulize by entering the X multiple integer of the {timeOfPlot} micro sec: ")
+    print("\nPress 0 to exit")
 
-    if int(SliceN)==0:
-        break
-    if NSamples<= 50:
-        scaler=1
-    elif NSamples> 50 and NSamples<200:
-        scaler=2
-    elif NSamples>= 200 and NSamples<1000:
-        scaler=50
+    while True:
+        raw_samples = input("Enter the number of samples in plot : 20,100,2000 : ")
+        if raw_samples.strip() == "0":
+            return 0, 0, 0
+
+        try:
+            nsamples = int(raw_samples) * 2
+            break
+        except ValueError:
+            print("Please enter a valid integer sample count.")
+
+    while True:
+        raw_slice = input("Select the slice you want to visualize by entering the X multiple integer of the sample window: ")
+        try:
+            slice_index = int(raw_slice)
+            break
+        except ValueError:
+            print("Please enter a valid integer slice number.")
+
+    if nsamples <= 50:
+        scaler = 1
+    elif nsamples < 200:
+        scaler = 2
+    elif nsamples < 1000:
+        scaler = 50
     else:
         scaler = 100
-        
-    BinaryFile = "captures/capture_Stah1090MHZ.bin"
 
-    start_byte = 0# Where to start reading
-    
+    return nsamples, slice_index, scaler
 
-    with open(BinaryFile, "rb") as f:
-        #  Move the pointer to the start of your slice
-        start_byte= (NSamples)*(int(SliceN)-1)
+
+def load_iq_samples(binary_file: str, num_bytes: int, slice_index: int) -> tuple[list[float], list[float]]:
+    """Load IQ bytes from the capture file and convert to I/Q sample pairs.
+
+    Args:
+        binary_file: path to the raw binary capture.
+        num_bytes: number of raw bytes to read.
+        slice_index: the slice to display.
+
+    Returns:
+        tuple: I and Q sample lists.
+    """
+    '''if not os.path.exists(binary_file):
+        raise FileNotFoundError(f"Binary file not found: {binary_file}")
+'''
+    start_byte = num_bytes * (slice_index - 1)
+    a = "C:/Users/ucef-/Desktop/adsb-receiver-project/captures/capture_Stah1090MHZ.bin"
+    with open(a, "rb") as f:
         f.seek(start_byte)
-        		 	
-        chunk = f.read(NSamples)
-        I = []
-        Q = []
-        Magnitude = []
-        DC_Shift = 0.7
-        def GetMagnitude(I,Q): 
-            mag = math.sqrt(I*I + Q*Q) #calculate Magnitude 
-            return round(mag, 2)
+        chunk = f.read(num_bytes)
+
+    if len(chunk) < num_bytes:
+        raise ValueError("Not enough data in the capture file for the requested slice.")
+
+    i_samples: list[float] = []
+    q_samples: list[float] = []
+
+    for idx, raw_value in enumerate(chunk):
+        normalized = raw_value - 127.5
+        if idx % 2 == 0:
+            i_samples.append(normalized)
+        else:
+            q_samples.append(normalized)
+
+    return i_samples, q_samples
+
+
+def compute_magnitudes(i_samples: list[float], q_samples: list[float], dc_shift: float = 0.7) -> list[float]:
+    """Compute the magnitude of each IQ sample pair."""
+    magnitudes: list[float] = []
+    for i, q in zip(i_samples, q_samples):
+        mag = math.sqrt(i * i + q * q) - dc_shift
+        magnitudes.append(round(mag, 2))
+    return magnitudes
+
+
+def build_preamble_template() -> np.ndarray:
+    """Build the ADS-B preamble pulse pattern used for correlation."""
+    preamble = np.zeros(26, dtype=float)
+    pulse_positions = [0, 2, 7, 9, 16, 19, 21, 23, 24]
+    preamble[pulse_positions] = 1.0
+    return preamble
+
+
+def detect_preamble_candidates(signal: list[float], preamble: np.ndarray, threshold: float = 8.0) -> tuple[dict[int, float], np.ndarray]:
+    """Detect candidate preamble locations using thresholded correlation."""
+    correlation_values = np.correlate(signal, preamble, mode="valid")
+    candidates: dict[int, float] = {}
+
+    for idx in range(20, len(correlation_values)):
+        valley_avg = 0.2 * (
+            correlation_values[idx - 6]
+            + correlation_values[idx - 11]
+            + correlation_values[idx - 13]
+            + correlation_values[idx - 18]
+            + correlation_values[idx - 20]
+        )
+        if valley_avg == 0:
+            continue
+
+        static_ratio = correlation_values[idx] / valley_avg
         
-        
-        for i in range(0,NSamples) : # To create two lists for I and Q samples and a list for Magnitudes
-
-            if (i%2)==0 :
-                I.append(chunk[i]-127.5)
-                if i==2:
-                        Magnitude.append(GetMagnitude(I[0],Q[0])- DC_Shift)
-                    
-                elif i>3:
-                    k = int((i/2)-1)
-                    Magnitude.append(GetMagnitude(I[k],Q[k])- DC_Shift)
-            else:
-                Q.append(chunk[i]-127.5)
-            
-
-        
-    # preamble pulses
-    #print(len(Magnitude))
-    preamble = np.zeros(26) #To create a list of 16 items that are zeros 
-    PeaksIndex = [0,2,7,9,16,19,21,23,24]
-    #print(preamble)
-    
-    f = []
-    for r in range(0,26):
-        for indx in PeaksIndex :
-            
-            
-            a = r==int(indx)
-            f.append(a)
-            if len(f)==len(PeaksIndex):
-                if sum(f)==1:
-                    preamble[r]=1
-                    f=[]
-                else:
-                    
-                    preamble[r] = 0
-                    f=[] # to write preamble pulses 
-                
-
-              
-
-    #print(preamble)
-    Pcounter=0
-    PreambleStart = []
-    limit = int(NSamples/2)-17
-    #EstimtedTime = (limit/10000)*37
-    #print(f"Time Estimation is {EstimtedTime} in Second")
-
-    lock = threading.Lock() # used to enable multiple threads to print or append list without corrupting the data
-    Pcounter=0
-    PreambleStart = []
-    
-    signal = Magnitude[0:int(NSamples/2)]
-
-    # CRITERION 1 : CFAR Detection 
-    CorrelationValues = np.correlate(signal, preamble, mode= "valid")
-    Static_Ratios = []
-    Threshold = 8
-    ExceedThreshold ={}
-    for maximum in range(20,len(CorrelationValues)):
-        Static_Ratio = 0
-        valleyAvg = 0.2*(CorrelationValues[maximum-6]+CorrelationValues[maximum-11]+
-            CorrelationValues[maximum-13]+CorrelationValues[maximum-18]+CorrelationValues[maximum-20])
-        PeakValue = CorrelationValues[maximum]
-
-        Static_Ratio = PeakValue/valleyAvg
-        #if valleyAvg <1 :
-        #    Static_Ratio= PeakValue/9
-        Static_Ratios.append(Static_Ratio)
-        if Static_Ratio>Threshold:
-            if ExceedThreshold:
-                # To ignore the peaks of correlation of the ppm
-                
-                    
-                if maximum-list(ExceedThreshold)[-1] < 240 :
-                    if Static_Ratio>list(ExceedThreshold.values())[-1]:
-                        ExceedThreshold.popitem()#delete last iem of dic
-                        ExceedThreshold[maximum] = Static_Ratio
-                else:    
-                        ExceedThreshold[maximum] = Static_Ratio 
-            else :    
-                ExceedThreshold[maximum] = Static_Ratio
-
-    def Bit_Slicer(message, Msg_length=224):
-        
-        for key,value in message.items():
-            #print(f"key is {key}")
-            decoded=[]
-
-            for k in range(0,Msg_length,2):
-                
-                #print(f"\nlen value : {len(value)} string index : {k} and the value is {value}")
-                if value[k] >= value[k+1]:
-                    decoded.append(1) 
-                elif value[k] < value[k+1]:
-                    decoded.append(0)
-                else:
-                    #del message[key]
-                    #print(f"Value 1 :{value[k]} and value2 : {value[k+1]} ")
-                    decoded[:] = "Rejected"
-                    break
-            #print(len(decoded))
-            message[key]="".join(map(str,decoded))
-            #print()
-    #Plotting the data using Matplotlib
-    Indices_2nd_criterion =[]
-    u =[]
-    Theta_2nd_criterion = {}
-    Theta = {}
-    
-
-        #print(f"\nnumber of exceed C1: {len(ExceedThreshold)} \nthe indices  {key:15} , correlation: {value} ")
-        
-    # Criterion 2 : DETERMINISTIC SYMBOL MATCH
-        
-        
-    for key, value in ExceedThreshold.items():
-        # 2. Logic to extract segments (Magnitude is likely your signal array)
-        e = Magnitude[key:key+26]
-        ref="110010001"
-        # We create a temporary dict for this specific key to pass to Bit_Slicer
-        temp_theta = {}
-        temp_theta[key] = e[0:4] + e[6:10] + e[-10:] # 18 samples total
-
-        # 3. Slice bits (18 samples / 2 = 9 bits)
-        Bit_Slicer(temp_theta, Msg_length=18)
-
-        # 4. Check for a match
-        # Since temp_theta only has one key, this loop is fast
-        for k, v in temp_theta.items():   
-            if v == ref:
-                # Save the match to our master dictionary
-                Theta_2nd_criterion[k] = v
-
-# Now, after the loop is done, you can see how many passed:
-    print(f"Total signals passing Criterion 2: {len(Theta_2nd_criterion)}")
-
-    max_idx = np.argmax(CorrelationValues)
-    #print(f"max value : {max(CorrelationValues)} index :{max_idx} ")
-    print(f"\nCriterion 1 : {len(ExceedThreshold)} success at {list(ExceedThreshold.keys())} ")
-    print(f"\nCriterion 2 : {len(Theta_2nd_criterion)} Success at {list(Theta_2nd_criterion.keys())}")
-    
-
-
-    #Criterion 3: Consistent Power Test
-    ThetaD ={}
-    h=[]
-    Thershold3 = 6.656
-    ThetaD_3rd_criterion = {}
-    for index in Theta_2nd_criterion.keys():
-        k=0
-        Initial_Magnitudes = Magnitude[index:index+26]
-        # 0,2,5,7,8,11,13,15,16
-        k = [Initial_Magnitudes[0],Initial_Magnitudes[2],Initial_Magnitudes[7],Initial_Magnitudes[9]
-        ,Initial_Magnitudes[16],Initial_Magnitudes[19],Initial_Magnitudes[21],Initial_Magnitudes[23],Initial_Magnitudes[24]]
-        ThetaD[index] = k
-        #print(f"\nkey is {index} k is {k}")
-        PowerRatio = max(k)/min(k)
-        #print(f" \nPowerRatio is : {(PowerRatio)},")
-        if PowerRatio<Thershold3 :
-            ThetaD_3rd_criterion[index] =   PowerRatio 
-            h.append(index)
-    print(f"\ncriterion 3 : {len(ThetaD_3rd_criterion)} success , shifts {list(ThetaD_3rd_criterion.keys())}")
-
-    
-    #criterion 4 :
-    Crit4 = {}
-    Success_4th_criterion = {}
-    for index in ThetaD_3rd_criterion.keys():
-                
-        Initial_Magnitudes= Magnitude[index:index+26]   
-        Pulses = [Initial_Magnitudes[0],Initial_Magnitudes[2],Initial_Magnitudes[7],Initial_Magnitudes[9]
-        ,Initial_Magnitudes[16],Initial_Magnitudes[19],Initial_Magnitudes[21],Initial_Magnitudes[23],Initial_Magnitudes[24]]
-        
-
-
-        sigma = sum(Pulses)/len(Pulses)        
-        
-        X =  [Initial_Magnitudes[4],Initial_Magnitudes[5]]+ Initial_Magnitudes[10:16]
-        for r in range(0,8,2):
-            if (X[r] and X[r+1]) <=(sigma/2):
-                Crit4[int(r/2)] = "Empty"
-        if len(Crit4)>=2:
-            Success_4th_criterion[index] = len(Crit4)
-    print(f"\ncriterion 4 : {len(Success_4th_criterion)} success , shifts {list(Success_4th_criterion.keys())}")
-                
-
-
-
-
-
-
-
-    msg ={}
-    for start in Success_4th_criterion.keys():
-            msg[start]= Magnitude[start + 16:start+ 240]
-    #print(msg)
-        
-    
-
-    def Decoding(binmsg):
-    # Ensure binmsg is a dictionary of binary strings
-        for key, value in binmsg.items():
-            print(f"\n{'='*50}")
-            print(f"REPORT FOR INDEX: {key}")
-            
-            try:
-                # 1. Convert binary string to Hex 
-                bin_str = str(value)
-                hex_msg = pms.util.bin2hex(bin_str)
-                
-                # 2. Decode the message 
-                decoded = pms.decode(hex_msg)
-                
-                # 3. Handle base validation
-                is_valid = decoded.get("crc_valid", False)
-                tc = decoded.get("typecode")
-                icao = decoded.get("icao")
-
-                print(f"Hex Message:  {hex_msg}")
-                print(f"CRC Result:   {'Valid' if is_valid else 'Corrupted'}")
-                print(f"ICAO Address: {icao}")
-                print(f"Typecode:     {tc}")
-                print(f"{'-'*50}")
-
-                if not is_valid or tc is None:
-                    print("Skipping detailed parse (Invalid CRC or Unknown Typecode).")
-                    continue
-
-                # 4. Detailed Parsing Logic
-
-                # IDENTIFICATION (Typecodes 1-4)
-                if 1 <= tc <= 4:
-                    print(f"[IDENTIFICATION]")
-                    print(f"Callsign: {decoded.get('callsign', 'N/A')}")
-
-                # SURFACE POSITION (Typecodes 5-8)
-                elif 5 <= tc <= 8:
-                    print(f"[SURFACE POSITION]")
-                    
-                    # Ground Speed Math
-                    gs = decoded.get('groundspeed')
-                    if gs is not None:
-                        gs_kmh = round(gs * 1.852, 2)
-                        print(f"Ground Speed: {gs} knots ({gs_kmh} km/h)")
-                    
-                    # Position & CPR Logic
-                    lat = decoded.get('latitude')
-                    lon = decoded.get('longitude')
-                    
-                    if lat is not None and lon is not None:
-                        print(f"Global Latitude:  {lat}")
-                        print(f"Global Longitude: {lon}")
-                    else:
-                        # Manually slice the Raw CPR values from the 112-bit binary string
-                        if len(bin_str) >= 88:
-                            raw_lat = int(bin_str[54:71], 2)
-                            raw_lon = int(bin_str[71:88], 2)
-                            print(f"Raw CPR Lat: {raw_lat} (Need reference to decode Global Lat)")
-                            print(f"Raw CPR Lon: {raw_lon} (Need reference to decode Global Lon)")
-                    
-                    # Get CPR Type (Fallback to checking bit 54 manually if missing)
-                    cpr = decoded.get("cpr_format")
-                    if cpr is None and len(bin_str) >= 54:
-                        cpr = int(bin_str[53])
-                    print(f"CPR Type: {'Odd' if cpr == 1 else 'Even'}")
-
-                # AIRBORNE POSITION (Typecodes 9-18)
-                elif 9 <= tc <= 18:
-                    print(f"[AIRBORNE POSITION]")
-                    print(f"Altitude:  {decoded.get('altitude', 'N/A')} ft")
-                    
-                    lat = decoded.get('latitude')
-                    lon = decoded.get('longitude')
-                    
-                    if lat is not None and lon is not None:
-                        print(f"Global Latitude:  {lat}")
-                        print(f"Global Longitude: {lon}")
-                    else:
-                        # Manually slice the Raw CPR values from the 112-bit binary string
-                        # Message Bit 55-71 (Lat) and 72-88 (Lon)
-                        if len(bin_str) >= 88:
-                            raw_lat = int(bin_str[54:71], 2)
-                            raw_lon = int(bin_str[71:88], 2)
-                            print(f"Raw CPR Lat: {raw_lat} (Need Odd/Even Pair to decode)")
-                            print(f"Raw CPR Lon: {raw_lon} (Need Odd/Even Pair to decode)")
-
-                    # Get CPR Type
-                    cpr = decoded.get("cpr_format")
-                    if cpr is None and len(bin_str) >= 54:
-                        cpr = int(bin_str[53])
-                    print(f"CPR Type: {'Odd' if cpr == 1 else 'Even'}")
-
-
-                # AIRBORNE VELOCITY (Typecode 19)
-                elif tc == 19:
-                    print(f"[AIRBORNE VELOCITY]")
-                    
-                    # Ground Speed Math (Knots to km/h)
-                    gs = decoded.get('groundspeed')
-                    if gs is not None:
-                        gs_kmh = round(gs * 1.852, 2)
-                        print(f"Ground Speed: {gs} knots ({gs_kmh} km/h)")
-                        print(f"Track Angle:  {decoded.get('track')}°")
-                    
-                    # Airspeed Math (Knots to km/h)
-                    airspeed = decoded.get('airspeed')
-                    if airspeed is not None:
-                        as_kmh = round(airspeed * 1.852, 2)
-                        print(f"Air Speed:    {airspeed} knots ({as_kmh} km/h)")
-                        print(f"Heading:      {decoded.get('heading')}°")
-                    
-                    # Vertical Rate Math (fpm to km/min and m/s)
-                    vrate_fpm = decoded.get('vertical_rate')
-                    if vrate_fpm is not None:
-                        # Convert to Kilometers per minute
-                        vrate_km_min = round((vrate_fpm * 0.3048) / 1000, 4)
-                        # Convert to Meters per second (Commonly used in engineering)
-                        vrate_ms = round((vrate_fpm * 0.3048) / 60, 2)
+        if static_ratio > threshold:
+            if candidates:
+                last_index = list(candidates)[-1]
+                if idx - last_index < 240 :
+                    if static_ratio > list(candidates.values())[-1]:
                         
-                        status = "Climbing" if vrate_fpm > 0 else "Descending"
-                        print(f"Vertical Rate: {vrate_fpm} fpm ({status})")
-                        print(f"            -> {abs(vrate_km_min)} km/min")
-                        print(f"            -> {abs(vrate_ms)} m/s")
+                        candidates.popitem()
+                        candidates[idx] = static_ratio
+                else:
+                        candidates[idx] = static_ratio
+            else:
+                    candidates[idx] = static_ratio
 
-                # OPERATIONAL STATUS (Typecode 31)
-                elif tc == 31:
-                    print(f"[OPERATIONAL STATUS]")
-                    print(f"Capability: {decoded.get('capability', 'N/A')}")
-
-            except Exception as e:
-                print(f"Detailed Error at index {key}: {e}")
-    def SNR_Calculation(indices):
-        for index in indices :        
+    return candidates, correlation_values
 
 
-            l = Magnitude[index:index+224]
-            x = (sum(l))*(sum(l))/224#SignalPower
-            
-            p = Magnitude[index-225:index-1]
-        
-            w = (sum(p))*(sum(p))/224 #noisePower
-            n = 10*math.log10(x/w)
-            print(f"\nthe SNR at {index} is {n}")
-    SNR_Calculation(Indices_2nd_criterion)
-    
-    Bit_Slicer(msg)
-    print(msg)
-    Decoding(msg)
-    
-    
-    if limit < 2000:
-        plt.style.use('_mpl-gallery')
-        
-        class SignalShifter:
-            def __init__(self, stem_container, base_xx, base_yy):
-                self.shift_amount = 0
-                self.stem_container = stem_container
-                self.base_xx = base_xx
-                self.base_yy = base_yy
-            def Update_position(self):
-                #new X positions
-                new_xx = self.base_xx + self.shift_amount
-                
-                #Update the stem markers (the dots)
-                self.stem_container.markerline.set_xdata(new_xx)#the circle at the top of the stick
-                
-                #Update the stem lines (the vertical sticks)
-                new_segments = [[[x, 0], [x, y]] for x, y in zip(new_xx, self.base_yy)] #[[x, 0], [x, y]] this represnet the coordinate 
-                self.stem_container.stemlines.set_segments(new_segments)#of the starting and ending point of the vertical line stick
-                #zip takes your new x positions and your original heights (y) and pairs them up like a zipper. 
-                #If x=5 and y=0.5, they become a pair: (5, 0.5).
-                
-                # 5. Redraw the plot!
-                plt.draw()
+def PPM_Demodulation(values: list[float]) -> str:
+    """Demodulate a list of magnitudes into a binary string based on pulse positions."""
+    if len(values) % 2 != 0:
+        return ""
 
-            def Shift_by_button(self, event):
-                
-                self.shift_amount += 1
-                self.Update_position()
-                #print(f"Shift amount: {self.shift_amount}")
-                
-                
-            def Shift_by_TextBox(self, text):
-                try:
-                    self.shift_amount=int(text)
-                    self.Update_position()
-                except:
-                    print("enter an integer")
+    bits: list[str] = []
+    for j in range(0, len(values), 2):
+        first = values[j]
+        second = values[j + 1]
+        bits.append("1" if first >= second else "0")
+    return "".join(bits)
 
 
-        Samples = int(NSamples/2)-1
-        x = np.arange(0, int(Samples))
-        y = Magnitude
+def apply_symbol_match(magnitude: list[float], candidates: dict[int, float]) -> dict[int, str]:
+    """Apply criterion 2 by checking known pulse symbol pattern."""
+    reference_bits = "110010001"
+    good_indices: dict[int, str] = {}
 
-        # the preamble pattern 
-        xx = np.arange(0, 26)
-        yy = np.zeros(26) 
-        yy[0], yy[2], yy[7], yy[9],yy[16],yy[19],yy[21],yy[23],yy[24] = 3, 3, 3, 3, 3, 3, 3, 3, 3
+    for index in candidates:
+        window = magnitude[index : index + 26]
+        if len(window) < 26:
+            continue
 
-        Last_index = len(CorrelationValues)
-        Corr_x = range(0,Last_index)
-        
-        Corr_y = CorrelationValues
+        extracted = window[0:4] + window[6:10] + window[-10:]
+        bits = PPM_Demodulation(extracted)
+        if bits == reference_bits:
+            good_indices[index] = bits
 
-        fig2 = plt.figure(figsize=(6,4))
-        cx = fig2.add_axes([0.07, 0.1, 1, 1])
-
-        fig = plt.figure(figsize=(6, 4))
-        ax = fig.add_axes([0.07, 0.1, 1, 1])
-
-        
-        
-        # Plot signal and stem
-        ax.plot(x, y, label="Signal")
-        line = ax.stem(xx, yy, linefmt='red', label="Preamble pulses")
-
-        ax.set_xlabel(f"IQ SAMPLES (A sample in 0.5 micro sec) S:{int(start_byte/2)}")
-        ax.set_ylabel("Magnitude ")
-
-        ax.set(xlim=(0, Samples), xticks= scaler*np.arange(1, Samples/scaler),
-               ylim=(0, 12), yticks=np.arange(1, 12))
-
-        #  Button
-        # Pass the stem container (line) and base arrays into the class
-        callback = SignalShifter(line, xx, yy)
-
-        ax_button = plt.axes([0.04, 0.005, 0.1, 0.04]) # [left, bottom, width, height]
-        btn = Button(ax_button, 'Shift', color='lightgray', hovercolor='white')
-        btn.on_clicked(callback.Shift_by_button)
-        box = plt.axes([0.87, 0.005, 0.1, 0.04])
-        InputShift= TextBox(box, "jump to: ", initial = "0")
-        InputShift.on_submit(callback.Shift_by_TextBox)
-        cx.plot(Corr_x,Corr_y, color="red")
-        cx.set(xlim=(0, Last_index), xticks= scaler*np.arange(1, Last_index/scaler),
-               ylim=(0, 500), yticks= range(0,500,50)) 
-        
-        plt.grid(visible=True)
-        plt.show()
-        #correlation graph 
+    return good_indices
 
 
-        
-        
-        #plt.grid(visible=True)
-        #plt.show()
+def apply_power_ratio_test(magnitude: list[float], indices: list[int], threshold: float = 6.656) -> dict[int, float]:
+    """Apply criterion 3 to reject inconsistent preamble power.
 
-    else :
-        print("\n Reduce the number of Samples in plot -must be lower than 2000 - in order to VISUALIZE!")
+    Returns indices that pass the power consistency check.
+    """
+    good_indices: dict[int, float] = {}
+    for index in indices:
+        window = magnitude[index : index + 26]
+        if len(window) < 26:
+            continue
+
+        pulses = [window[pos] for pos in [0, 2, 7, 9, 16, 19, 21, 23, 24]]
+        min_pulse = min(pulses)
+        if min_pulse == 0:
+            continue
+
+        power_ratio = max(pulses) / min_pulse
+        if power_ratio < threshold:
+            good_indices[index] = power_ratio
+
+    return good_indices
+
+
+def apply_empty_slot_test(magnitude: list[float], indices: list[int]) -> dict[int, int]:
+    """Apply criterion 4 by verifying empty symbol regions."""
+    good_indices: dict[int, int] = {}
+    for index in indices:
+        window = magnitude[index : index + 26]
+        if len(window) < 26:
+            continue
+
+        pulse_positions = [0, 2, 7, 9, 16, 19, 21, 23, 24]
+        pulses = [window[pos] for pos in pulse_positions]
+        sigma = sum(pulses) / len(pulses)
+
+        test_positions = [4, 5, 10, 11, 12, 13, 14, 15]
+        empty_count = 0
+        for pos in range(0, len(test_positions), 2):
+            left = window[test_positions[pos]]
+            right = window[test_positions[pos + 1]]
+            if max(left, right) <= sigma / 2:
+                empty_count += 1
+
+        if empty_count >= 2:
+            good_indices[index] = empty_count
+
+    return good_indices
+
+
+def build_raw_messages(magnitude: list[float], indices: list[int]) -> dict[int, str]:
+    """Build raw binary strings for candidate ADS-B messages."""
+    messages: dict[int, str] = {}
+    for index in indices:
+        raw_frame = magnitude[index + 16 : index + 240]
+        if len(raw_frame) < 224:
+            continue
+        messages[index] = PPM_Demodulation(raw_frame)
+    return messages
+
+
+def decode_messages(messages: dict[int, str]) -> None:
+    """Decode and print ADS-B messages using pyModeS."""
+    for index, binary_string in messages.items():
+        print("\n" + "=" * 50)
+        print(f"REPORT FOR INDEX: {index}")
+        try:
+            hex_msg = pms.util.bin2hex(binary_string)
+            decoded = pms.decode(hex_msg)
+            valid_crc = decoded.get("crc_valid", False)
+            tc = decoded.get("typecode")
+            icao = decoded.get("icao")
+
+            print(f"Hex Message:  {hex_msg}")
+            print(f"CRC Result:   {'Valid' if valid_crc else 'Corrupted'}")
+            print(f"ICAO Address: {icao}")
+            print(f"Typecode:     {tc}")
+            print("-" * 50)
+
+            if not valid_crc or tc is None:
+                print("Skipping detailed parse (Invalid CRC or Unknown Typecode).")
+                continue
+
+            if 1 <= tc <= 4:
+                print("[IDENTIFICATION]")
+                print(f"Callsign: {decoded.get('callsign', 'N/A')}")
+            elif 5 <= tc <= 8:
+                print("[SURFACE POSITION]")
+                print_position(decoded, binary_string)
+            elif 9 <= tc <= 18:
+                print("[AIRBORNE POSITION]")
+                print(f"Altitude:  {decoded.get('altitude', 'N/A')} ft")
+                print_position(decoded, binary_string)
+            elif tc == 19:
+                print("[AIRBORNE VELOCITY]")
+                print_velocity(decoded)
+            elif tc == 31:
+                print("[OPERATIONAL STATUS]")
+                print(f"Capability: {decoded.get('capability', 'N/A')}")
+        except Exception as exc:
+            print(f"Detailed Error at index {index}: {exc}")
+
+
+def print_position(decoded: dict, binary_string: str) -> None:
+    """Print position fields or raw CPR values when global coords are missing."""
+    lat = decoded.get("latitude")
+    lon = decoded.get("longitude")
+    if lat is not None and lon is not None:
+        print(f"Global Latitude:  {lat}")
+        print(f"Global Longitude: {lon}")
+    elif len(binary_string) >= 88:
+        raw_lat = int(binary_string[54:71], 2)
+        raw_lon = int(binary_string[71:88], 2)
+        print(f"Raw CPR Lat: {raw_lat} (Need reference to decode Global Lat)")
+        print(f"Raw CPR Lon: {raw_lon} (Need reference to decode Global Lon)")
+
+    cpr = decoded.get("cpr_format")
+    if cpr is None and len(binary_string) >= 54:
+        cpr = int(binary_string[53])
+    print(f"CPR Type: {'Odd' if cpr == 1 else 'Even'}")
+
+
+def print_velocity(decoded: dict) -> None:
+    """Print velocity fields with unit conversions."""
+    gs = decoded.get("groundspeed")
+    if gs is not None:
+        gs_kmh = round(gs * 1.852, 2)
+        print(f"Ground Speed: {gs} knots ({gs_kmh} km/h)")
+        print(f"Track Angle:  {decoded.get('track')}°")
+
+    airspeed = decoded.get("airspeed")
+    if airspeed is not None:
+        as_kmh = round(airspeed * 1.852, 2)
+        print(f"Air Speed:    {airspeed} knots ({as_kmh} km/h)")
+        print(f"Heading:      {decoded.get('heading')}°")
+
+    vrate_fpm = decoded.get("vertical_rate")
+    if vrate_fpm is not None:
+        vrate_km_min = round((vrate_fpm * 0.3048) / 1000, 4)
+        vrate_ms = round((vrate_fpm * 0.3048) / 60, 2)
+        status = "Climbing" if vrate_fpm > 0 else "Descending"
+        print(f"Vertical Rate: {vrate_fpm} fpm ({status})")
+        print(f"            -> {abs(vrate_km_min)} km/min")
+        print(f"            -> {abs(vrate_ms)} m/s")
+
+
+def compute_snr(magnitude: list[float], candidate_indices: list[int]) -> None:
+    """Estimate SNR for each final candidate index."""
+    for index in candidate_indices:
+        if index < 225 or index + 224 > len(magnitude):
+            continue
+
+        signal_power = sum(magnitude[index : index + 224]) ** 2 / 224
+        noise_power = sum(magnitude[index - 225 : index - 1]) ** 2 / 224
+        if noise_power <= 0:
+            continue
+
+        snr_db = 10 * math.log10(signal_power / noise_power)
+        print(f"\nSNR at index {index}: {snr_db:.2f} dB")
+
+
+def plot_signal(magnitude: list[float], correlation_values: np.ndarray, start_byte: int, scaler: int) -> None:
+    """Plot the signal magnitude and correlation values."""
+    if not magnitude:
+        return
+
+    class SignalShifter:
+        def __init__(self, stem_container, base_xx, base_yy):
+            self.shift_amount = 0
+            self.stem_container = stem_container
+            self.base_xx = base_xx
+            self.base_yy = base_yy
+
+        def update_position(self):
+            new_xx = self.base_xx + self.shift_amount
+            self.stem_container.markerline.set_xdata(new_xx)
+            new_segments = [[[x, 0], [x, y]] for x, y in zip(new_xx, self.base_yy)]
+            self.stem_container.stemlines.set_segments(new_segments)
+            plt.draw()
+
+        def shift_by_button(self, event):
+            self.shift_amount += 1
+            self.update_position()
+
+        def shift_by_text(self, text):
+            try:
+                self.shift_amount = int(text)
+                self.update_position()
+            except ValueError:
+                print("Please enter an integer.")
+
+    sample_count = len(magnitude)
+    x = np.arange(sample_count)
+    y = np.array(magnitude)
+
+    preamble_x = np.arange(26)
+    preamble_y = np.zeros(26)
+    preamble_y[[0, 2, 7, 9, 16, 19, 21, 23, 24]] = 3
+
+    fig = plt.figure(figsize=(6, 4))
+    ax = fig.add_axes([0.07, 0.1, 1, 1])
+    ax.plot(x, y, label="Signal")
+    stem_container = ax.stem(preamble_x, preamble_y, linefmt="red", label="Preamble pulses")
+    ax.set_xlabel(f"IQ SAMPLES (0.5 µs per sample), start byte: {start_byte}")
+    ax.set_ylabel("Magnitude")
+    ax.set_xlim(0, sample_count)
+    ax.set_ylim(0, max(y) + 1)
+    ax.set_xticks(scaler * np.arange(1, max(2, sample_count // scaler)))
+    ax.grid(True)
+
+    callback = SignalShifter(stem_container, preamble_x, preamble_y)
+    button_ax = plt.axes([0.04, 0.005, 0.1, 0.04])
+    btn = Button(button_ax, "Shift", color="lightgray", hovercolor="white")
+    btn.on_clicked(callback.shift_by_button)
+
+    textbox_ax = plt.axes([0.87, 0.005, 0.1, 0.04])
+    textbox = TextBox(textbox_ax, "jump to:", initial="0")
+    textbox.on_submit(callback.shift_by_text)
+
+    corr_fig = plt.figure(figsize=(6, 4))
+    corr_ax = corr_fig.add_axes([0.07, 0.1, 1, 1])
+    corr_ax.plot(np.arange(len(correlation_values)), correlation_values, color="red")
+    corr_ax.set_xlim(0, len(correlation_values))
+    corr_ax.set_ylim(0, max(correlation_values) + 10)
+    corr_ax.grid(True)
+
+    plt.show()
+
+
+def main() -> None:
+    binary_file = os.path.join(os.path.dirname(__file__), "captures", "capture_Stah1090MHZ.bin")
+
+    while True:
+        nsamples, slice_index, scaler = prompt_user_parameters()
+        if slice_index == 0:
+            break
+
+        i_samples, q_samples = load_iq_samples(binary_file, nsamples, slice_index)
+        magnitudes = compute_magnitudes(i_samples, q_samples)
+        preamble = build_preamble_template()
+        signal = magnitudes[: nsamples // 2]
+
+        candidates, correlation_values = detect_preamble_candidates(signal, preamble)
+        matched_candidates = apply_symbol_match(magnitudes, candidates)
+        power_candidates = apply_power_ratio_test(magnitudes, list(matched_candidates.keys()))
+        final_candidates = apply_empty_slot_test(magnitudes, list(power_candidates.keys()))
+
+        print(f"\nCriterion 1: {len(candidates)} candidates -> {list(candidates.keys())}")
+        print(f"Criterion 2: {len(matched_candidates)} matches -> {list(matched_candidates.keys())}")
+        print(f"Criterion 3: {len(power_candidates)} power-consistent -> {list(power_candidates.keys())}")
+        print(f"Criterion 4: {len(final_candidates)} final candidates -> {list(final_candidates.keys())}")
+
+        raw_messages = build_raw_messages(magnitudes, list(final_candidates.keys()))
+        decode_messages(raw_messages)
+        compute_snr(magnitudes, list(final_candidates.keys()))
+
+        if nsamples <= 2000:
+            plot_signal(magnitudes, correlation_values, nsamples * (slice_index - 1), scaler)
+        else:
+            print("\nReduce the number of samples to lower than 2000 to visualize.")
+
+
+if __name__ == "__main__":
+    main()
+
+'''Path('SignalVisualizer.py').write_text(content, encoding='utf-8')
+PY'''
