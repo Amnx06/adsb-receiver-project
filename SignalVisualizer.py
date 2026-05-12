@@ -63,7 +63,7 @@ def load_iq_samples(binary_file: str, num_bytes: int, slice_index: int) -> tuple
         raise FileNotFoundError(f"Binary file not found: {binary_file}")
 '''
     start_byte = num_bytes * (slice_index - 1)
-    a = "C:/Users/ucef-/Desktop/adsb-receiver-project/captures/capture_Stah1090MHZ.bin"
+    a = "C:/Users/ucef-/Desktop/Captures/ForRtl/output_8bit.bin"
     with open(a, "rb") as f:
         f.seek(start_byte)
         chunk = f.read(num_bytes)
@@ -84,7 +84,7 @@ def load_iq_samples(binary_file: str, num_bytes: int, slice_index: int) -> tuple
     return i_samples, q_samples
 
 
-def compute_magnitudes(i_samples: list[float], q_samples: list[float], dc_shift: float = 0.7) -> list[float]:
+def compute_magnitudes(i_samples: list[float], q_samples: list[float], dc_shift: float = 7) -> list[float]:
     """Compute the magnitude of each IQ sample pair."""
     magnitudes: list[float] = []
     for i, q in zip(i_samples, q_samples):
