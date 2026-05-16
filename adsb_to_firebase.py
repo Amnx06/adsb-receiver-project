@@ -1,0 +1,310 @@
+
+
+"""
+adsb_to_firebase.py
+────────────────────────────────────────────────────────────────────────────
+Standalone watcher process.  Run this in a SEPARATE terminal alongside
+SignalVisualizer.py:
+
+    Terminal 1:  python3 SignalVisualizer.py
+    Terminal 2:  python3 adsb_to_firebase.py
+
+How it works:
+  1. Watches the  output/  folder using watchdog (OS-level file events,
+     no polling delay).
+  2. The instant SignalVisualizer writes  output/<shift_index>.json ,
+     this process picks it up, reads it, and pushes it to Firebase at
+         adsb/latest/messages/<icao>
+     so the Flutter app receives the update in real time.
+  3. The processed file is moved to  output/sent/  so it is never
+     pushed twice.
+  4. Also maintains a rolling  output/results_all.json  with every
+     frame seen in the current session.
+
+Requirements:
+    pip install watchdog firebase-admin
+
+Firebase setup:
+  1. Firebase Console → Project Settings → Service Accounts
+     → Generate new private key → save as  serviceAccountKey.json
+  2. Set FIREBASE_DB_URL below.
+────────────────────────────────────────────────────────────────────────────
+"""
+
+import json
+import os
+import shutil
+import time
+import datetime
+import threading
+
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+# ── CONFIG ─────────────────────────────────────────────────────
+
+SERVICE_ACCOUNT = "serviceAccountKey.json"
+
+OUTPUT_DIR = "output"
+SENT_DIR = os.path.join(OUTPUT_DIR, "sent")
+RESULTS_ALL = os.path.join(OUTPUT_DIR, "results_all.json")
+
+# ───────────────────────────────────────────────────────────────
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(SENT_DIR, exist_ok=True)
+
+SESSION_START = datetime.datetime.now(datetime.UTC).isoformat()
+
+# ═══════════════════════════════════════════════════════════════
+# FIREBASE FIRESTORE INIT
+# ═══════════════════════════════════════════════════════════════
+
+_firestore_ready = False
+_firestore_db = None
+
+
+def _init_firebase():
+    global _firestore_ready, _firestore_db
+
+    try:
+        import firebase_admin
+        from firebase_admin import credentials, firestore
+    except ImportError:
+        print("[!] firebase-admin not installed")
+        print("Run: pip install firebase-admin")
+        return
+
+    if not os.path.exists(SERVICE_ACCOUNT):
+        print(f"[!] Missing {SERVICE_ACCOUNT}")
+        return
+
+    try:
+        if not firebase_admin._apps:
+            cred = credentials.Certificate(SERVICE_ACCOUNT)
+            firebase_admin.initialize_app(cred)
+
+        _firestore_db = firestore.client()
+
+        _firestore_ready = True
+
+        print("[✓] Firestore connected successfully")
+
+    except Exception as e:
+        print(f"[!] Firebase init failed: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# SESSION STORAGE
+# ═══════════════════════════════════════════════════════════════
+
+_session_messages = {}
+_session_lock = threading.Lock()
+
+
+def _write_results_all():
+    data = {
+        "session_start": SESSION_START,
+        "total_frames": len(_session_messages),
+        "messages": list(_session_messages.values()),
+    }
+
+    tmp = RESULTS_ALL + ".tmp"
+
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+
+    os.replace(tmp, RESULTS_ALL)
+
+
+# ═══════════════════════════════════════════════════════════════
+# FIRESTORE PUSH
+# ═══════════════════════════════════════════════════════════════
+
+def _push_single(record: dict, icao: str):
+
+    msg_type = record.get("message_type", "UNKNOWN")
+
+    payload = {
+        "icao": record.get("icao"),
+        "callsign": record.get("callsign"),
+        "type": msg_type,
+        "altitude_ft": record.get("altitude_ft"),
+        "altitude_m": record.get("altitude_m"),
+        "latitude": record.get("latitude"),
+        "longitude": record.get("longitude"),
+        "raw_cpr_lat": record.get("raw_cpr_lat"),
+        "raw_cpr_lon": record.get("raw_cpr_lon"),
+        "cpr_format": record.get("cpr_format"),
+        "groundspeed_kt": record.get("groundspeed_kt"),
+        "groundspeed_kmh": record.get("groundspeed_kmh"),
+        "track_angle_deg": record.get("track_angle_deg"),
+        "vertical_rate_fpm": record.get("vertical_rate_fpm"),
+        "vertical_rate_ms": record.get("vertical_rate_ms"),
+        "vertical_status": record.get("vertical_status"),
+        "snr_db": record.get("snr_db"),
+        "crc_valid": record.get("crc_valid", False),
+        "shift_index": record.get("shift_index"),
+        "captured_at": record.get("captured_at"),
+        "last_update": datetime.datetime.now(datetime.UTC).isoformat(),
+    }
+
+    try:
+
+        (
+            _firestore_db
+            .collection("adsb")
+            .document("latest")
+            .collection("messages")
+            .document(icao)
+            .collection("types")
+            .document(msg_type)
+            .set(payload)
+        )
+
+        print(f"  [✓] Firestore → {icao}/{msg_type}")
+
+    except Exception as e:
+        print(f"  [!] Firestore push failed: {e}")
+
+# ═══════════════════════════════════════════════════════════════
+# PROCESS FILE
+# ═══════════════════════════════════════════════════════════════
+
+def _process_file(filepath: str):
+
+    for _ in range(10):
+        try:
+            if os.path.getsize(filepath) > 0:
+                break
+        except FileNotFoundError:
+            return
+
+        time.sleep(0.02)
+
+    try:
+        with open(filepath, "r") as f:
+            record = json.load(f)
+
+    except Exception as e:
+        print(f"[!] Could not read {filepath}: {e}")
+        return
+
+    icao = record.get("icao") or "UNKNOWN"
+    shift_index = record.get("shift_index", 0)
+    msg_type = record.get("message_type", "UNKNOWN")
+    crc_ok = record.get("crc_valid", False)
+    snr = record.get("snr_db")
+
+    print(
+        f"\n[→] Frame detected idx:{shift_index:>8} "
+        f"ICAO:{icao} type:{msg_type} "
+        f"CRC:{'✓' if crc_ok else '✗'} "
+        f"SNR:{snr} dB"
+    )
+
+    if _firestore_ready:
+        _push_single(record, icao)
+
+    session_key = f"{icao}_{shift_index}"
+
+    with _session_lock:
+        _session_messages[session_key] = record
+        _write_results_all()
+
+    dest = os.path.join(SENT_DIR, os.path.basename(filepath))
+
+    try:
+        shutil.move(filepath, dest)
+        print(f"  [✓] archived → {dest}")
+
+    except Exception as e:
+        print(f"[!] Could not move file: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# WATCHDOG
+# ═══════════════════════════════════════════════════════════════
+
+class _JSONHandler(FileSystemEventHandler):
+
+    def _is_target(self, path: str) -> bool:
+        name = os.path.basename(path)
+
+        return (
+            name.endswith(".json")
+            and name[:-5].lstrip("-").isdigit()
+        )
+
+    def on_created(self, event):
+
+        if not event.is_directory and self._is_target(event.src_path):
+
+            time.sleep(0.02)
+            _process_file(event.src_path)
+
+    def on_moved(self, event):
+
+        if not event.is_directory and self._is_target(event.dest_path):
+
+            time.sleep(0.02)
+            _process_file(event.dest_path)
+
+
+# ═══════════════════════════════════════════════════════════════
+# DRAIN OLD FILES
+# ═══════════════════════════════════════════════════════════════
+
+def _drain_existing():
+
+    pending = sorted([
+        os.path.join(OUTPUT_DIR, f)
+        for f in os.listdir(OUTPUT_DIR)
+        if f.endswith(".json")
+        and f[:-5].lstrip("-").isdigit()
+    ])
+
+    if pending:
+
+        print(f"[i] {len(pending)} unprocessed file(s)")
+
+        for fp in pending:
+            _process_file(fp)
+
+
+# ═══════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+
+    print("======================================")
+    print(" ADS-B → Firestore Watcher")
+    print("======================================")
+
+    _init_firebase()
+
+    _drain_existing()
+
+    observer = Observer()
+
+    observer.schedule(
+        _JSONHandler(),
+        path=OUTPUT_DIR,
+        recursive=False
+    )
+
+    observer.start()
+
+    print(f"[✓] Watching {OUTPUT_DIR}/")
+
+    try:
+        while True:
+            time.sleep(1)
+
+    except KeyboardInterrupt:
+        observer.stop()
+
+    observer.join()
+
+    print(f"\n[i] Session total: {len(_session_messages)}")
