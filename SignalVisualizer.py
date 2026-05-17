@@ -1,434 +1,530 @@
-from pathlib import Path
 import math
-import os
 import matplotlib.pyplot as plt
 import numpy as np
+import time
 from matplotlib.widgets import Button, TextBox
+import threading
+import json
 import pyModeS as pms
+from pyModeS.util import bin2hex, crc
+import os
 
+# A script to visualize the sample(or time) versus magnitude signal from SDR tuned to 1090 MHz
+# WITH SDR Sampling Frequency set to 2 Million Samples Per Second
+# Chunked streaming version: processes 120 MB file in 100k-sample chunks
+# Results are written to JSON immediately when a preamble is confirmed
 
-def prompt_user_parameters() -> tuple[int, int, int]:
-    """Ask the user for the number of samples and the slice.
+# ── Global results store (written live to disk on every confirmed detection) ──
+RESULTS_FILE = "output/results.json"
+os.makedirs("output", exist_ok=True)
 
-    Returns:
-        tuple: (num_iq_bytes, slice_index, scaler)
+if os.path.exists(RESULTS_FILE):
+    with open(RESULTS_FILE, "r") as _f:
+        all_results = json.load(_f)
+else:
+    all_results = {
+        "capture_file": "",
+        "sample_rate_msps": 2,
+        "detections": [],
+        "total_c1": 0,
+        "total_c2": 0,
+        "total_c3": 0,
+        "total_final": 0
+    }
+
+# ── Preamble template (26-element characteristic word) ───────────────────────
+preamble    = np.zeros(26)
+PeaksIndex  = [0, 2, 7, 9, 16, 19, 21, 23, 24]   # α-positions
+for _p in PeaksIndex:
+    preamble[_p] = 1
+
+# ── Bit slicer (unchanged from your original) ────────────────────────────────
+def Bit_Slicer(message, Msg_length=224):
+    for key, value in message.items():
+        decoded = []
+        for k in range(0, Msg_length, 2):
+            if value[k] >= value[k + 1]:
+                decoded.append(1)
+            elif value[k] < value[k + 1]:
+                decoded.append(0)
+            else:
+                decoded[:] = "Rejected"
+                break
+        message[key] = "".join(map(str, decoded))
+
+# ── SNR calculation (unchanged from your original) ───────────────────────────
+def SNR_Calculation(index, signal):
+    l = signal[index: index + 224]
+    p = signal[max(0, index - 225): index - 1]
+    x = (sum(l)) * (sum(l)) / 224          # signal power estimate
+    w = (sum(p)) * (sum(p)) / 224          # noise power estimate
+    if w <= 0:
+        return 0.0
+    return round(10 * math.log10(x / w), 2)
+
+# ── Write one confirmed detection to JSON immediately ─────────────────────────
+def save_detection(local_idx, global_byte, c1_ratio, c3_ratio,
+                   c4_count, signal):
+    snr = SNR_Calculation(local_idx, signal)
+
+    detection = {
+        "global_byte_offset": global_byte,
+        "c1_ratio":           round(c1_ratio, 3),
+        "c2_match":           True,
+        "c3_power_ratio":     round(c3_ratio, 3),
+        "c4_null_count":      c4_count,
+        "snr_db":             snr,
+        "final_decision":     True
+    }
+
+    all_results["detections"].append(detection)
+    all_results["total_final"] += 1
+
+    with open(RESULTS_FILE, "w") as _f:
+        json.dump(all_results, _f, indent=2)
+
+    print(f"\n✓  PREAMBLE CONFIRMED"
+          f"  global_byte={global_byte:,}"
+          f"  SNR={snr:.1f} dB"
+          f"  C1={c1_ratio:.1f}"
+          f"  C3={c3_ratio:.2f}"
+          f"  C4_nulls={c4_count}")
+
+# ── Process one chunk: run all 4 criteria, write JSON on each confirmation ───
+def process_chunk(signal, byte_offset, overlap_len,
+                  total_c1, total_c2, total_c3, total_c4):
     """
+    signal      : list of magnitude floats  =  overlap_buffer + chunk_mag
+                  signal[0]  is NOT the start of the current chunk —
+                  the first overlap_len samples belong to the END of the
+                  previous chunk (already counted in byte_offset).
+
+    byte_offset : file byte position of the FIRST byte of chunk_mag
+                  (i.e. the position AFTER the previous chunk, NOT
+                  counting the overlap).
+
+    overlap_len : number of samples prepended from the previous chunk.
+
+    Global sample index of signal[i]:
+        global_sample = (byte_offset // 2) - overlap_len + i
+    Global byte offset of signal[i]:
+        global_byte   = global_sample * 2
+
+    total_c1/2/3/4 : running counters, returned updated
+    """
+
+    # ── CRITERION 1: CFAR correlation ────────────────────────────────────────
+    CorrelationValues = np.correlate(signal, preamble, mode="valid")
+
+    Threshold        = 8
+    ExceedThreshold  = {}           # { local_index : c1_ratio }
+
+    for maximum in range(20, len(CorrelationValues)):
+        valleyAvg = 0.2 * (
+            CorrelationValues[maximum - 6]  +
+            CorrelationValues[maximum - 11] +
+            CorrelationValues[maximum - 13] +
+            CorrelationValues[maximum - 18] +
+            CorrelationValues[maximum - 20]
+        )
+        if valleyAvg < 0.001:       # avoid division by zero / very small noise
+            continue
+
+        PeakValue    = CorrelationValues[maximum]
+        Static_Ratio = PeakValue / valleyAvg
+
+        if Static_Ratio > Threshold:
+            if ExceedThreshold:
+                last_key = list(ExceedThreshold)[-1]
+                if maximum - last_key < 240:
+                    # Re-triggering: keep only the stronger peak
+                    if Static_Ratio > list(ExceedThreshold.values())[-1]:
+                        ExceedThreshold.popitem()
+                        ExceedThreshold[maximum] = Static_Ratio
+                else:
+                    ExceedThreshold[maximum] = Static_Ratio
+            else:
+                ExceedThreshold[maximum] = Static_Ratio
+
+    total_c1 += len(ExceedThreshold)
+    #print(f"  C1: {len(ExceedThreshold)} candidates at indices "
+    #      f"{list(ExceedThreshold.keys())}")
+
+    # ── CRITERIA 2 / 3 / 4: tested immediately for each C1 candidate ─────────
+    ref = "110010001"     # deterministic symbol pattern for DF=17
+
+    for local_idx, c1_ratio in ExceedThreshold.items():
+
+        # bounds check: need at least 26 samples ahead
+        if local_idx + 26 > len(signal):
+            continue
+
+        # ── CRITERION 2: Deterministic Symbol Match ───────────────────────
+        window = signal[local_idx: local_idx + 26]
+
+        # 18 samples covering the 9 symbol pairs
+        samples_18 = window[0:4] + window[6:10] + window[16:]  # same as your original
+
+        temp = {local_idx: samples_18}
+        Bit_Slicer(temp, Msg_length=18)
+
+        if temp[local_idx] != ref:
+            continue                # C2 failed → discard immediately
+
+        total_c2 += 1
+      #  print(f"    C2 passed at local_idx={local_idx}")
+
+        # ── CRITERION 3: Consistent Power Test ───────────────────────────
+        # Use the CORRECT α-positions from the paper
+        peaks_9 = [
+            window[0],  window[2],  window[7],  window[9],
+            window[16], window[19], window[21], window[23], window[24]
+        ]
+
+        peak_min = min(peaks_9)
+        if peak_min <= 0:
+            continue                # avoid division by zero
+
+        c3_ratio  = max(peaks_9) / peak_min
+        Threshold3 = 5.656
+
+        if c3_ratio >= Threshold3:
+            continue                # C3 failed → discard immediately
+
+        total_c3 += 1
+       # print(f"    C3 passed at local_idx={local_idx}  power_ratio={c3_ratio:.2f}")
+
+        # ── CRITERION 4: Null Symbol Validation ──────────────────────────
+        sigma = sum(peaks_9) / 9    # dynamic threshold = mean of 9 peaks
+
+        # β-positions: the 4 null symbol intervals (2 samples each)
+        null_pairs = [
+            (window[4],  window[5]),
+            (window[10], window[11]),
+            (window[12], window[13]),
+            (window[14], window[15])
+        ]
+
+        empty_count = 0
+        for s1, s2 in null_pairs:
+            if s1 <= sigma / 2 and s2 <= sigma / 2:
+                empty_count += 1
+
+        if empty_count < 2:
+            continue                # C4 failed → discard immediately
+
+        # ── ALL 4 CRITERIA PASSED ─────────────────────────────────────────
+        total_c4 += 1
+
+        # ── Correct global byte address ───────────────────────────────────
+        # signal = buffer + chunk_mag
+        # signal[0] is the first overlap sample, which already appeared
+        # at the END of the previous chunk. Its file byte position is:
+#            (byte_offset - overlap_len * 2)
+        # Therefore signal[local_idx] is at:
+#            global_sample = (byte_offset // 2) - overlap_len + local_idx
+#            global_byte   = global_sample * 2
+        global_sample = (byte_offset // 2) - overlap_len + local_idx
+        global_byte   = global_sample
+
+        save_detection(local_idx, global_byte,
+                       c1_ratio, c3_ratio, empty_count, signal)
+
+    return total_c1, total_c2, total_c3, total_c4
+
+
+#main 
+condition = True
+while condition:
+    BinaryFile = "C:/Users/ucef-/Desktop/Captures/ForRtl/output_8bit.bin"
+    file_size  = os.path.getsize(BinaryFile)
+    print("=====================>>>>>>>><<<<<<<==================")
+    print(f"\nWelcome to ADS-B Visualizer >>> your file is of size {file_size}")
     print("=====================>>>>>>>><<<<<<<==================")
     print("\nWelcome to ADS-B Visualizer >>>")
     print("\nPress 0 to exit")
 
-    while True:
-        raw_samples = input("Enter the number of samples in plot : 20,100,2000 : ")
-        if raw_samples.strip() == "0":
-            return 0, 0, 0
+    NSamples   = int(input("Enter the number of samples in plot (20, 100, 2000): ")) * 2
+    timeOfPlot = (NSamples / 2) * 0.5
+    SliceN     = input(
+        f"Select the slice you want to visualize by entering the X multiple "
+        f"integer of the {timeOfPlot} micro sec: "
+    )
 
-        try:
-            nsamples = int(raw_samples) * 2
-            break
-        except ValueError:
-            print("Please enter a valid integer sample count.")
+    if int(SliceN) == 0:
+        break
 
-    while True:
-        raw_slice = input("Select the slice you want to visualize by entering the X multiple integer of the sample window: ")
-        try:
-            slice_index = int(raw_slice)
-            break
-        except ValueError:
-            print("Please enter a valid integer slice number.")
-
-    if nsamples <= 50:
+    # scaler for plot x-axis ticks (unchanged)
+    if NSamples <= 50:
         scaler = 1
-    elif nsamples < 200:
+    elif NSamples <= 200:
         scaler = 2
-    elif nsamples < 1000:
+    elif NSamples <= 1000:
         scaler = 50
     else:
         scaler = 100
 
-    return nsamples, slice_index, scaler
+    
+    file_size  = os.path.getsize(BinaryFile)
+    all_results["capture_file"] = BinaryFile
 
+    print(f"\nFile: {BinaryFile}  ({file_size/1e6:.1f} MB)")
 
-def load_iq_samples(binary_file: str, num_bytes: int, slice_index: int) -> tuple[list[float], list[float]]:
-    """Load IQ bytes from the capture file and convert to I/Q sample pairs.
+    CHUNK_SAMPLES = 100_000     # 100k IQ pairs = 200k bytes per chunk
+    OVERLAP       = 256         # samples carried over to next chunk
+    DC_Shift      = 0.7
 
-    Args:
-        binary_file: path to the raw binary capture.
-        num_bytes: number of raw bytes to read.
-        slice_index: the slice to display.
+    buffer      = []            # overlap buffer from previous chunk
+    byte_offset = 0             # current file position in bytes
+    total_c1 = total_c2 = total_c3 = total_c4 = 0
 
-    Returns:
-        tuple: I and Q sample lists.
-    """
-    '''if not os.path.exists(binary_file):
-        raise FileNotFoundError(f"Binary file not found: {binary_file}")
-'''
-    start_byte = num_bytes * (slice_index - 1)
-    a = "C:/Users/ucef-/Desktop/Captures/ForRtl/output_8bit.bin"
-    with open(a, "rb") as f:
-        f.seek(start_byte)
-        chunk = f.read(num_bytes)
+    # ── Store ONE chunk for the visualiser (the slice the user asked for) ──
+    vis_start_byte = NSamples * (int(SliceN) - 1)
+    vis_Magnitude  = []
+    vis_CorrelationValues = None
 
-    if len(chunk) < num_bytes:
-        raise ValueError("Not enough data in the capture file for the requested slice.")
+    with open(BinaryFile, "rb") as f:
 
-    i_samples: list[float] = []
-    q_samples: list[float] = []
+        while byte_offset < file_size:
 
-    for idx, raw_value in enumerate(chunk):
-        normalized = raw_value - 127.5
-        if idx % 2 == 0:
-            i_samples.append(normalized)
-        else:
-            q_samples.append(normalized)
+            raw = f.read(CHUNK_SAMPLES * 2)     # read 200k bytes
+            if not raw:
+                break
 
-    return i_samples, q_samples
+            # ── Convert bytes → magnitude (same formula as your original) ──
+            chunk_mag = []
+            for i in range(0, len(raw) - 1, 2):
+                I_val = raw[i]     - 127.5
+                Q_val = raw[i + 1] - 127.5
+                chunk_mag.append(math.sqrt(I_val * I_val + Q_val * Q_val) - DC_Shift)
 
+            # ── Prepend overlap from previous chunk ──
+            signal = buffer + chunk_mag
 
-def compute_magnitudes(i_samples: list[float], q_samples: list[float], dc_shift: float = 7) -> list[float]:
-    """Compute the magnitude of each IQ sample pair."""
-    magnitudes: list[float] = []
-    for i, q in zip(i_samples, q_samples):
-        mag = math.sqrt(i * i + q * q) - dc_shift
-        magnitudes.append(round(mag, 2))
-    return magnitudes
+            # ── Capture the slice the user wants for the visualiser ──
+            if vis_start_byte >= byte_offset and \
+               vis_start_byte < byte_offset + len(raw):
+                local_start = (vis_start_byte - byte_offset) // 2
+                vis_Magnitude = signal[local_start: local_start + NSamples // 2]
+                vis_CorrelationValues = np.correlate(
+                    vis_Magnitude, preamble, mode="valid"
+                )
 
+            # ── Run the 4-criterion detector on this chunk ──
+            total_c1, total_c2, total_c3, total_c4 = process_chunk(
+                signal, byte_offset, len(buffer),
+                total_c1, total_c2, total_c3, total_c4
+            )
 
-def build_preamble_template() -> np.ndarray:
-    """Build the ADS-B preamble pulse pattern used for correlation."""
-    preamble = np.zeros(26, dtype=float)
-    pulse_positions = [0, 2, 7, 9, 16, 19, 21, 23, 24]
-    preamble[pulse_positions] = 1.0
-    return preamble
+            # ── Update running totals in results file ──
+            all_results["total_c1"] = total_c1
+            all_results["total_c2"] = total_c2
+            all_results["total_c3"] = total_c3
+            all_results["total_final"] = total_c4
 
+            # ── Carry overlap to next chunk ──
+            buffer      = chunk_mag[-OVERLAP:]
+            byte_offset += len(raw)
 
-def detect_preamble_candidates(signal: list[float], preamble: np.ndarray, threshold: float = 8.0) -> tuple[dict[int, float], np.ndarray]:
-    """Detect candidate preamble locations using thresholded correlation."""
-    correlation_values = np.correlate(signal, preamble, mode="valid")
-    candidates: dict[int, float] = {}
+            print(f"  Progress: {byte_offset/1e6:.1f} MB / "
+                  f"{file_size/1e6:.0f} MB   "
+                  f"confirmed={total_c4}", end="\r")
 
-    for idx in range(20, len(correlation_values)):
-        valley_avg = 0.2 * (
-            correlation_values[idx - 6]
-            + correlation_values[idx - 11]
-            + correlation_values[idx - 13]
-            + correlation_values[idx - 18]
-            + correlation_values[idx - 20]
-        )
-        if valley_avg == 0:
-            continue
+    print(f"\n\nDone. C1={total_c1}  C2={total_c2}  "
+          f"C3={total_c3}  Final={total_c4}")
+    print(f"Results saved to {RESULTS_FILE}")
 
-        static_ratio = correlation_values[idx] / valley_avg
-        
-        if static_ratio > threshold:
-            if candidates:
-                last_index = list(candidates)[-1]
-                if idx - last_index < 240 :
-                    if static_ratio > list(candidates.values())[-1]:
-                        
-                        candidates.popitem()
-                        candidates[idx] = static_ratio
-                else:
-                        candidates[idx] = static_ratio
-            else:
-                    candidates[idx] = static_ratio
+    # ── Use vis_Magnitude for the visualiser below (same as your original) ──
+    Magnitude        = vis_Magnitude  if vis_Magnitude  else []
+    CorrelationValues = vis_CorrelationValues if vis_CorrelationValues is not None \
+                        else np.array([0])
+    limit = len(Magnitude) - 17
+    start_byte = vis_start_byte
 
-    return candidates, correlation_values
+    # ════════════════════════════════════════════════════════════════════════
+    # EVERYTHING BELOW THIS LINE IS YOUR ORIGINAL VISUALISER CODE UNCHANGED
+    # ════════════════════════════════════════════════════════════════════════
 
-
-def PPM_Demodulation(values: list[float]) -> str:
-    """Demodulate a list of magnitudes into a binary string based on pulse positions."""
-    if len(values) % 2 != 0:
-        return ""
-
-    bits: list[str] = []
-    for j in range(0, len(values), 2):
-        first = values[j]
-        second = values[j + 1]
-        bits.append("1" if first >= second else "0")
-    return "".join(bits)
-
-
-def apply_symbol_match(magnitude: list[float], candidates: dict[int, float]) -> dict[int, str]:
-    """Apply criterion 2 by checking known pulse symbol pattern."""
-    reference_bits = "110010001"
-    good_indices: dict[int, str] = {}
-
-    for index in candidates:
-        window = magnitude[index : index + 26]
-        if len(window) < 26:
-            continue
-
-        extracted = window[0:4] + window[6:10] + window[-10:]
-        bits = PPM_Demodulation(extracted)
-        if bits == reference_bits:
-            good_indices[index] = bits
-
-    return good_indices
-
-
-def apply_power_ratio_test(magnitude: list[float], indices: list[int], threshold: float = 6.656) -> dict[int, float]:
-    """Apply criterion 3 to reject inconsistent preamble power.
-
-    Returns indices that pass the power consistency check.
-    """
-    good_indices: dict[int, float] = {}
-    for index in indices:
-        window = magnitude[index : index + 26]
-        if len(window) < 26:
-            continue
-
-        pulses = [window[pos] for pos in [0, 2, 7, 9, 16, 19, 21, 23, 24]]
-        min_pulse = min(pulses)
-        if min_pulse == 0:
-            continue
-
-        power_ratio = max(pulses) / min_pulse
-        if power_ratio < threshold:
-            good_indices[index] = power_ratio
-
-    return good_indices
-
-
-def apply_empty_slot_test(magnitude: list[float], indices: list[int]) -> dict[int, int]:
-    """Apply criterion 4 by verifying empty symbol regions."""
-    good_indices: dict[int, int] = {}
-    for index in indices:
-        window = magnitude[index : index + 26]
-        if len(window) < 26:
-            continue
-
-        pulse_positions = [0, 2, 7, 9, 16, 19, 21, 23, 24]
-        pulses = [window[pos] for pos in pulse_positions]
-        sigma = sum(pulses) / len(pulses)
-
-        test_positions = [4, 5, 10, 11, 12, 13, 14, 15]
-        empty_count = 0
-        for pos in range(0, len(test_positions), 2):
-            left = window[test_positions[pos]]
-            right = window[test_positions[pos + 1]]
-            if max(left, right) <= sigma / 2:
-                empty_count += 1
-
-        if empty_count >= 2:
-            good_indices[index] = empty_count
-
-    return good_indices
-
-
-def build_raw_messages(magnitude: list[float], indices: list[int]) -> dict[int, str]:
-    """Build raw binary strings for candidate ADS-B messages."""
-    messages: dict[int, str] = {}
-    for index in indices:
-        raw_frame = magnitude[index + 16 : index + 240]
-        if len(raw_frame) < 224:
-            continue
-        messages[index] = PPM_Demodulation(raw_frame)
-    return messages
-
-
-def decode_messages(messages: dict[int, str]) -> None:
-    """Decode and print ADS-B messages using pyModeS."""
-    for index, binary_string in messages.items():
-        print("\n" + "=" * 50)
-        print(f"REPORT FOR INDEX: {index}")
-        try:
-            hex_msg = pms.util.bin2hex(binary_string)
-            decoded = pms.decode(hex_msg)
-            valid_crc = decoded.get("crc_valid", False)
-            tc = decoded.get("typecode")
-            icao = decoded.get("icao")
-
-            print(f"Hex Message:  {hex_msg}")
-            print(f"CRC Result:   {'Valid' if valid_crc else 'Corrupted'}")
-            print(f"ICAO Address: {icao}")
-            print(f"Typecode:     {tc}")
-            print("-" * 50)
-
-            if not valid_crc or tc is None:
-                print("Skipping detailed parse (Invalid CRC or Unknown Typecode).")
-                continue
-
-            if 1 <= tc <= 4:
-                print("[IDENTIFICATION]")
-                print(f"Callsign: {decoded.get('callsign', 'N/A')}")
-            elif 5 <= tc <= 8:
-                print("[SURFACE POSITION]")
-                print_position(decoded, binary_string)
-            elif 9 <= tc <= 18:
-                print("[AIRBORNE POSITION]")
-                print(f"Altitude:  {decoded.get('altitude', 'N/A')} ft")
-                print_position(decoded, binary_string)
-            elif tc == 19:
-                print("[AIRBORNE VELOCITY]")
-                print_velocity(decoded)
-            elif tc == 31:
-                print("[OPERATIONAL STATUS]")
-                print(f"Capability: {decoded.get('capability', 'N/A')}")
-        except Exception as exc:
-            print(f"Detailed Error at index {index}: {exc}")
-
-
-def print_position(decoded: dict, binary_string: str) -> None:
-    """Print position fields or raw CPR values when global coords are missing."""
-    lat = decoded.get("latitude")
-    lon = decoded.get("longitude")
-    if lat is not None and lon is not None:
-        print(f"Global Latitude:  {lat}")
-        print(f"Global Longitude: {lon}")
-    elif len(binary_string) >= 88:
-        raw_lat = int(binary_string[54:71], 2)
-        raw_lon = int(binary_string[71:88], 2)
-        print(f"Raw CPR Lat: {raw_lat} (Need reference to decode Global Lat)")
-        print(f"Raw CPR Lon: {raw_lon} (Need reference to decode Global Lon)")
-
-    cpr = decoded.get("cpr_format")
-    if cpr is None and len(binary_string) >= 54:
-        cpr = int(binary_string[53])
-    print(f"CPR Type: {'Odd' if cpr == 1 else 'Even'}")
-
-
-def print_velocity(decoded: dict) -> None:
-    """Print velocity fields with unit conversions."""
-    gs = decoded.get("groundspeed")
-    if gs is not None:
-        gs_kmh = round(gs * 1.852, 2)
-        print(f"Ground Speed: {gs} knots ({gs_kmh} km/h)")
-        print(f"Track Angle:  {decoded.get('track')}°")
-
-    airspeed = decoded.get("airspeed")
-    if airspeed is not None:
-        as_kmh = round(airspeed * 1.852, 2)
-        print(f"Air Speed:    {airspeed} knots ({as_kmh} km/h)")
-        print(f"Heading:      {decoded.get('heading')}°")
-
-    vrate_fpm = decoded.get("vertical_rate")
-    if vrate_fpm is not None:
-        vrate_km_min = round((vrate_fpm * 0.3048) / 1000, 4)
-        vrate_ms = round((vrate_fpm * 0.3048) / 60, 2)
-        status = "Climbing" if vrate_fpm > 0 else "Descending"
-        print(f"Vertical Rate: {vrate_fpm} fpm ({status})")
-        print(f"            -> {abs(vrate_km_min)} km/min")
-        print(f"            -> {abs(vrate_ms)} m/s")
-
-
-def compute_snr(magnitude: list[float], candidate_indices: list[int]) -> None:
-    """Estimate SNR for each final candidate index."""
-    for index in candidate_indices:
-        if index < 225 or index + 224 > len(magnitude):
-            continue
-
-        signal_power = sum(magnitude[index : index + 224]) ** 2 / 224
-        noise_power = sum(magnitude[index - 225 : index - 1]) ** 2 / 224
-        if noise_power <= 0:
-            continue
-
-        snr_db = 10 * math.log10(signal_power / noise_power)
-        print(f"\nSNR at index {index}: {snr_db:.2f} dB")
-
-
-def plot_signal(magnitude: list[float], correlation_values: np.ndarray, start_byte: int, scaler: int) -> None:
-    """Plot the signal magnitude and correlation values."""
-    if not magnitude:
-        return
-
-    class SignalShifter:
-        def __init__(self, stem_container, base_xx, base_yy):
-            self.shift_amount = 0
-            self.stem_container = stem_container
-            self.base_xx = base_xx
-            self.base_yy = base_yy
-
-        def update_position(self):
-            new_xx = self.base_xx + self.shift_amount
-            self.stem_container.markerline.set_xdata(new_xx)
-            new_segments = [[[x, 0], [x, y]] for x, y in zip(new_xx, self.base_yy)]
-            self.stem_container.stemlines.set_segments(new_segments)
-            plt.draw()
-
-        def shift_by_button(self, event):
-            self.shift_amount += 1
-            self.update_position()
-
-        def shift_by_text(self, text):
+    def Decoding(binmsg):
+        for key, value in binmsg.items():
+            print(f"\n{'='*50}")
+            print(f"REPORT FOR INDEX: {key}")
             try:
-                self.shift_amount = int(text)
-                self.update_position()
-            except ValueError:
-                print("Please enter an integer.")
+                bin_str = str(value)
+                hex_msg = pms.util.bin2hex(bin_str)
+                decoded = pms.decode(hex_msg)
+                is_valid = decoded.get("crc_valid", False)
+                tc   = decoded.get("typecode")
+                icao = decoded.get("icao")
+                print(f"Hex Message:  {hex_msg}")
+                print(f"CRC Result:   {'Valid' if is_valid else 'Corrupted'}")
+                print(f"ICAO Address: {icao}")
+                print(f"Typecode:     {tc}")
+                print(f"{'-'*50}")
+                if not is_valid or tc is None:
+                    print("Skipping detailed parse (Invalid CRC or Unknown Typecode).")
+                    continue
+                if 1 <= tc <= 4:
+                    print(f"[IDENTIFICATION]")
+                    print(f"Callsign: {decoded.get('callsign', 'N/A')}")
+                elif 5 <= tc <= 8:
+                    print(f"[SURFACE POSITION]")
+                    gs = decoded.get('groundspeed')
+                    if gs is not None:
+                        print(f"Ground Speed: {gs} knots ({round(gs*1.852,2)} km/h)")
+                    lat = decoded.get('latitude')
+                    lon = decoded.get('longitude')
+                    if lat is not None and lon is not None:
+                        print(f"Latitude:  {lat}")
+                        print(f"Longitude: {lon}")
+                    else:
+                        if len(bin_str) >= 88:
+                            print(f"Raw CPR Lat: {int(bin_str[54:71],2)}")
+                            print(f"Raw CPR Lon: {int(bin_str[71:88],2)}")
+                elif 9 <= tc <= 18:
+                    print(f"[AIRBORNE POSITION]")
+                    print(f"Altitude: {decoded.get('altitude','N/A')} ft")
+                    lat = decoded.get('latitude')
+                    lon = decoded.get('longitude')
+                    if lat is not None and lon is not None:
+                        print(f"Latitude:  {lat}")
+                        print(f"Longitude: {lon}")
+                    else:
+                        if len(bin_str) >= 88:
+                            print(f"Raw CPR Lat: {int(bin_str[54:71],2)}")
+                            print(f"Raw CPR Lon: {int(bin_str[71:88],2)}")
+                elif tc == 19:
+                    print(f"[AIRBORNE VELOCITY]")
+                    gs = decoded.get('groundspeed')
+                    if gs is not None:
+                        print(f"Ground Speed: {gs} knots ({round(gs*1.852,2)} km/h)")
+                        print(f"Track Angle:  {decoded.get('track')}°")
+                    airspeed = decoded.get('airspeed')
+                    if airspeed is not None:
+                        print(f"Air Speed: {airspeed} knots ({round(airspeed*1.852,2)} km/h)")
+                        print(f"Heading:   {decoded.get('heading')}°")
+                    vrate_fpm = decoded.get('vertical_rate')
+                    if vrate_fpm is not None:
+                        vrate_ms = round((vrate_fpm * 0.3048) / 60, 2)
+                        status = "Climbing" if vrate_fpm > 0 else "Descending"
+                        print(f"Vertical Rate: {vrate_fpm} fpm ({status}) → {abs(vrate_ms)} m/s")
+                elif tc == 31:
+                    print(f"[OPERATIONAL STATUS]")
+                    print(f"Capability: {decoded.get('capability','N/A')}")
+            except Exception as e:
+                print(f"Error at index {key}: {e}")
 
-    sample_count = len(magnitude)
-    x = np.arange(sample_count)
-    y = np.array(magnitude)
+    # Build msg from confirmed detections for decoding
+    msg = {}
+    for det in all_results["detections"]:
+        # re-map global byte back to vis_Magnitude local index for display
+        g_byte = det["global_byte_offset"]
+        local  = (g_byte - vis_start_byte) // 2
+        if 0 <= local < len(Magnitude) - 240:
+            msg[local] = Magnitude[local + 16: local + 240]
 
-    preamble_x = np.arange(26)
-    preamble_y = np.zeros(26)
-    preamble_y[[0, 2, 7, 9, 16, 19, 21, 23, 24]] = 3
+    try:
+        Bit_Slicer(msg)
+    except Exception:
+        print("\nCould not slice message bits — increase samples")
+    print(msg)
+    Decoding(msg)
+    limit = NSamples//2
+    if limit < 2000:
+        plt.style.use('_mpl-gallery')
+        
+        class SignalShifter:
+            def __init__(self, stem_container, base_xx, base_yy):
+                self.shift_amount = 0
+                self.stem_container = stem_container
+                self.base_xx = base_xx
+                self.base_yy = base_yy
+            def Update_position(self):
+                #new X positions
+                new_xx = self.base_xx + self.shift_amount
+                
+                #Update the stem markers (the dots)
+                self.stem_container.markerline.set_xdata(new_xx)#the circle at the top of the stick
+                
+                #Update the stem lines (the vertical sticks)
+                new_segments = [[[x, 0], [x, y]] for x, y in zip(new_xx, self.base_yy)] #[[x, 0], [x, y]] this represnet the coordinate 
+                self.stem_container.stemlines.set_segments(new_segments)#of the starting and ending point of the vertical line stick
+                #zip takes your new x positions and your original heights (y) and pairs them up like a zipper. 
+                #If x=5 and y=0.5, they become a pair: (5, 0.5).
+                
+                # 5. Redraw the plot!
+                plt.draw()
 
-    fig = plt.figure(figsize=(6, 4))
-    ax = fig.add_axes([0.07, 0.1, 1, 1])
-    ax.plot(x, y, label="Signal")
-    stem_container = ax.stem(preamble_x, preamble_y, linefmt="red", label="Preamble pulses")
-    ax.set_xlabel(f"IQ SAMPLES (0.5 µs per sample), start byte: {start_byte}")
-    ax.set_ylabel("Magnitude")
-    ax.set_xlim(0, sample_count)
-    ax.set_ylim(0, max(y) + 1)
-    ax.set_xticks(scaler * np.arange(1, max(2, sample_count // scaler)))
-    ax.grid(True)
-
-    callback = SignalShifter(stem_container, preamble_x, preamble_y)
-    button_ax = plt.axes([0.04, 0.005, 0.1, 0.04])
-    btn = Button(button_ax, "Shift", color="lightgray", hovercolor="white")
-    btn.on_clicked(callback.shift_by_button)
-
-    textbox_ax = plt.axes([0.87, 0.005, 0.1, 0.04])
-    textbox = TextBox(textbox_ax, "jump to:", initial="0")
-    textbox.on_submit(callback.shift_by_text)
-
-    corr_fig = plt.figure(figsize=(6, 4))
-    corr_ax = corr_fig.add_axes([0.07, 0.1, 1, 1])
-    corr_ax.plot(np.arange(len(correlation_values)), correlation_values, color="red")
-    corr_ax.set_xlim(0, len(correlation_values))
-    corr_ax.set_ylim(0, max(correlation_values) + 10)
-    corr_ax.grid(True)
-
-    plt.show()
-
-
-def main() -> None:
-    binary_file = os.path.join(os.path.dirname(__file__), "captures", "capture_Stah1090MHZ.bin")
-
-    while True:
-        nsamples, slice_index, scaler = prompt_user_parameters()
-        if slice_index == 0:
-            break
-
-        i_samples, q_samples = load_iq_samples(binary_file, nsamples, slice_index)
-        magnitudes = compute_magnitudes(i_samples, q_samples)
-        preamble = build_preamble_template()
-        signal = magnitudes[: nsamples // 2]
-
-        candidates, correlation_values = detect_preamble_candidates(signal, preamble)
-        matched_candidates = apply_symbol_match(magnitudes, candidates)
-        power_candidates = apply_power_ratio_test(magnitudes, list(matched_candidates.keys()))
-        final_candidates = apply_empty_slot_test(magnitudes, list(power_candidates.keys()))
-
-        print(f"\nCriterion 1: {len(candidates)} candidates -> {list(candidates.keys())}")
-        print(f"Criterion 2: {len(matched_candidates)} matches -> {list(matched_candidates.keys())}")
-        print(f"Criterion 3: {len(power_candidates)} power-consistent -> {list(power_candidates.keys())}")
-        print(f"Criterion 4: {len(final_candidates)} final candidates -> {list(final_candidates.keys())}")
-
-        raw_messages = build_raw_messages(magnitudes, list(final_candidates.keys()))
-        decode_messages(raw_messages)
-        compute_snr(magnitudes, list(final_candidates.keys()))
-
-        if nsamples <= 2000:
-            plot_signal(magnitudes, correlation_values, nsamples * (slice_index - 1), scaler)
-        else:
-            print("\nReduce the number of samples to lower than 2000 to visualize.")
+            def Shift_by_button(self, event):
+                
+                self.shift_amount += 1
+                self.Update_position()
+                #print(f"Shift amount: {self.shift_amount}")
+                
+                
+            def Shift_by_TextBox(self, text):
+                try:
+                    self.shift_amount=int(text)
+                    self.Update_position()
+                except:
+                    print("enter an integer")
 
 
-if __name__ == "__main__":
-    main()
+        Samples = int(NSamples/2)-1
+        x = np.arange(0, int(Samples))
+        y = Magnitude
 
-'''Path('SignalVisualizer.py').write_text(content, encoding='utf-8')
-PY'''
+        # the preamble pattern 
+        xx = np.arange(0, 26)
+        yy = np.zeros(26) 
+        yy[0], yy[2], yy[7], yy[9],yy[16],yy[19],yy[21],yy[23],yy[24] = 3, 3, 3, 3, 3, 3, 3, 3, 3
+
+        Last_index = len(CorrelationValues)
+        Corr_x = range(0,Last_index)
+        
+        Corr_y = CorrelationValues
+
+        fig2 = plt.figure(figsize=(6,4))
+        cx = fig2.add_axes([0.07, 0.1, 1, 1])
+
+        fig = plt.figure(figsize=(6, 4))
+        ax = fig.add_axes([0.07, 0.1, 1, 1])
+
+        
+        
+        # Plot signal and stem
+        ax.plot(x, y, label="Signal")
+        line = ax.stem(xx, yy, linefmt='red', label="Preamble pulses")
+
+        ax.set_xlabel(f"IQ SAMPLES (A sample in 0.5 micro sec) S:{int(start_byte/2)}")
+        ax.set_ylabel("Magnitude ")
+
+        ax.set(xlim=(0, Samples), xticks= scaler*np.arange(1, Samples/scaler),
+               ylim=(0, 12), yticks=np.arange(1, 12))
+
+        #  Button
+        # Pass the stem container (line) and base arrays into the class
+        callback = SignalShifter(line, xx, yy)
+
+        ax_button = plt.axes([0.04, 0.005, 0.1, 0.04]) # [left, bottom, width, height]
+        btn = Button(ax_button, 'Shift', color='lightgray', hovercolor='white')
+        btn.on_clicked(callback.Shift_by_button)
+        box = plt.axes([0.87, 0.005, 0.1, 0.04])
+        InputShift= TextBox(box, "jump to: ", initial = "0")
+        InputShift.on_submit(callback.Shift_by_TextBox)
+        cx.plot(Corr_x,Corr_y, color="red")
+        cx.set(xlim=(0, Last_index), xticks= scaler*np.arange(1, Last_index/scaler),
+               ylim=(0, 500), yticks= range(0,500,50)) 
+        
+        plt.grid(visible=True)
+        plt.show()
+        #correlation graph 
+
+
+        
+        
+        #plt.grid(visible=True)
+        #plt.show()
+
+    else :
+        print("\n Reduce the number of Samples in plot -must be lower than 2000 - in order to VISUALIZE!")
